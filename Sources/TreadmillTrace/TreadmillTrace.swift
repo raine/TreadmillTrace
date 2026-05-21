@@ -1,4 +1,5 @@
 import CoreBluetooth
+import Darwin
 import Foundation
 
 @main
@@ -55,8 +56,14 @@ final class BLECapture: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
     private var discovered: [UUID: DiscoveredPeripheral] = [:]
     private var selected: CBPeripheral?
     private var selectedServices: Set<CBUUID> = []
+    private var readRequests: Set<String> = []
+    private var notifiedCharacteristics: Set<String> = []
+    private var pendingNotifyEnables: Set<String> = []
     private var pendingServiceDiscoveries = 0
-    private var pendingCharacteristicDiscoveries = 0
+    private var setupComplete = false
+    private var scanStarted = false
+    private var discoveryTimeout: Timer?
+    private var signalSources: [DispatchSourceSignal] = []
 
     init(logger: TraceLogger, scanSeconds: TimeInterval) {
         self.logger = logger
@@ -73,6 +80,7 @@ final class BLECapture: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
             "tool": "TreadmillTrace",
             "os": ProcessInfo.processInfo.operatingSystemVersionString,
         ])
+        setupSignalHandlers()
         central = CBCentralManager(delegate: self, queue: nil)
         RunLoop.main.run()
     }
@@ -80,11 +88,25 @@ final class BLECapture: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
     func centralManagerDidUpdateState(_ central: CBCentralManager) {
         logger.write("central.state", ["state": describe(central.state)])
 
-        guard central.state == .poweredOn else {
-            print("Bluetooth is not powered on: \(describe(central.state))")
+        switch central.state {
+        case .poweredOn:
+            startScanIfNeeded()
+        case .unknown, .resetting:
             return
+        case .poweredOff, .unauthorized, .unsupported:
+            print("Bluetooth is not available: \(describe(central.state))")
+            logger.write("session.end", ["reason": "bluetooth_unavailable", "state": describe(central.state)])
+            finish(1)
+        @unknown default:
+            print("Bluetooth is in an unsupported state: \(describe(central.state))")
+            logger.write("session.end", ["reason": "bluetooth_unknown_state", "state": describe(central.state)])
+            finish(1)
         }
+    }
 
+    private func startScanIfNeeded() {
+        guard !scanStarted else { return }
+        scanStarted = true
         central.scanForPeripherals(
             withServices: nil,
             options: [CBCentralManagerScanOptionAllowDuplicatesKey: false]
@@ -125,9 +147,12 @@ final class BLECapture: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
 
     func centralManager(_ central: CBCentralManager, didConnect peripheral: CBPeripheral) {
         print("Connected to \(peripheral.name ?? "device"). Discovering services...")
+        startDiscoveryTimeout(reason: "discovery_timeout")
         logger.write("ble.connect", [
             "id": peripheral.identifier.uuidString,
             "name": peripheral.name ?? "Unknown",
+            "maximumWriteWithResponse": peripheral.maximumWriteValueLength(for: .withResponse),
+            "maximumWriteWithoutResponse": peripheral.maximumWriteValueLength(for: .withoutResponse),
         ])
         peripheral.delegate = self
         peripheral.discoverServices(nil)
@@ -140,7 +165,7 @@ final class BLECapture: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
             "error": error?.localizedDescription ?? "none",
         ])
         print("Failed to connect: \(error?.localizedDescription ?? "unknown error")")
-        exit(1)
+        finish(1)
     }
 
     func centralManager(_ central: CBCentralManager, didDisconnectPeripheral peripheral: CBPeripheral, error: Error?) {
@@ -150,14 +175,14 @@ final class BLECapture: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
             "error": error?.localizedDescription ?? "none",
         ])
         print("Disconnected. Log saved to \(logger.path)")
-        exit(0)
+        finish(0)
     }
 
     func peripheral(_ peripheral: CBPeripheral, didDiscoverServices error: Error?) {
         if let error {
             logger.write("ble.services_error", ["error": error.localizedDescription])
             print("Service discovery failed: \(error.localizedDescription)")
-            exit(1)
+            finish(1)
         }
 
         let services = peripheral.services ?? []
@@ -167,6 +192,12 @@ final class BLECapture: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
             "uuids": services.map { $0.uuid.uuidString },
         ])
 
+        guard !services.isEmpty else {
+            logger.write("session.end", ["reason": "no_services"])
+            print("No services found on selected device.")
+            finish(1)
+        }
+
         for service in services {
             selectedServices.insert(service.uuid)
             peripheral.discoverCharacteristics(nil, for: service)
@@ -174,6 +205,11 @@ final class BLECapture: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
     }
 
     func peripheral(_ peripheral: CBPeripheral, didDiscoverCharacteristicsFor service: CBService, error: Error?) {
+        defer {
+            pendingServiceDiscoveries -= 1
+            checkSetupComplete()
+        }
+
         if let error {
             logger.write("ble.characteristics_error", [
                 "service": service.uuid.uuidString,
@@ -195,24 +231,34 @@ final class BLECapture: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
             },
         ])
 
-        for characteristic in characteristics where characteristic.properties.contains(.notify) || characteristic.properties.contains(.indicate) {
-            pendingCharacteristicDiscoveries += 1
-            peripheral.setNotifyValue(true, for: characteristic)
+        for characteristic in characteristics {
+            if characteristic.properties.contains(.notify) || characteristic.properties.contains(.indicate) {
+                pendingNotifyEnables.insert(characteristicKey(characteristic))
+                peripheral.setNotifyValue(true, for: characteristic)
+            }
+
+            if characteristic.properties.contains(.read) {
+                readRequests.insert(characteristicKey(characteristic))
+                peripheral.readValue(for: characteristic)
+            }
         }
 
-        pendingServiceDiscoveries -= 1
-        if pendingServiceDiscoveries == 0 {
-            printCaptureInstructions()
-        }
     }
 
     func peripheral(_ peripheral: CBPeripheral, didUpdateNotificationStateFor characteristic: CBCharacteristic, error: Error?) {
+        let key = characteristicKey(characteristic)
+        pendingNotifyEnables.remove(key)
+        if characteristic.isNotifying {
+            notifiedCharacteristics.insert(key)
+        }
+
         logger.write("ble.notify_state", [
             "service": characteristic.service?.uuid.uuidString ?? "unknown",
             "characteristic": characteristic.uuid.uuidString,
             "isNotifying": characteristic.isNotifying,
             "error": error?.localizedDescription ?? "none",
         ])
+        checkSetupComplete()
     }
 
     func peripheral(_ peripheral: CBPeripheral, didUpdateValueFor characteristic: CBCharacteristic, error: Error?) {
@@ -226,14 +272,21 @@ final class BLECapture: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
         }
 
         guard let data = characteristic.value else { return }
+        let key = characteristicKey(characteristic)
+        let wasReadRequest = readRequests.remove(key) != nil
         logger.write("ble.rx", [
             "service": characteristic.service?.uuid.uuidString ?? "unknown",
             "characteristic": characteristic.uuid.uuidString,
+            "source": wasReadRequest ? "read" : "notify",
             "length": data.count,
             "hex": data.hexString,
             "base64": data.base64EncodedString(),
             "ftms": parseFTMSIfKnown(characteristic: characteristic, data: data),
         ])
+    }
+
+    private func characteristicKey(_ characteristic: CBCharacteristic) -> String {
+        "\(characteristic.service?.uuid.uuidString ?? "unknown")/\(characteristic.uuid.uuidString)"
     }
 
     private func finishScan() {
@@ -247,7 +300,7 @@ final class BLECapture: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
         guard !devices.isEmpty else {
             print("No BLE devices found.")
             logger.write("session.end", ["reason": "no_devices"])
-            exit(1)
+            finish(1)
         }
 
         print("Discovered devices:")
@@ -259,43 +312,119 @@ final class BLECapture: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
         print("")
         print("Choose the Vitalwalk/treadmill number to connect, or press return for the first candidate:")
 
-        let input = readLine()?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        let selectedIndex: Int
-        if input.isEmpty {
-            selectedIndex = devices.firstIndex(where: \.candidate) ?? 0
-        } else if let number = Int(input), devices.indices.contains(number - 1) {
-            selectedIndex = number - 1
-        } else {
-            print("Invalid selection.")
-            exit(1)
-        }
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let input = readLine()?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            DispatchQueue.main.async {
+                guard let self else { return }
+                let selectedIndex: Int
+                if input.isEmpty {
+                    selectedIndex = devices.firstIndex(where: \.candidate) ?? 0
+                } else if let number = Int(input), devices.indices.contains(number - 1) {
+                    selectedIndex = number - 1
+                } else {
+                    print("Invalid selection.")
+                    self.logger.write("session.end", ["reason": "invalid_selection"])
+                    self.finish(1)
+                }
 
-        let device = devices[selectedIndex]
-        selected = device.peripheral
-        logger.write("ble.selection", [
-            "id": device.peripheral.identifier.uuidString,
-            "name": device.name,
-            "rssi": device.rssi,
-            "candidate": device.candidate,
-        ])
-        print("Connecting to \(device.name)...")
-        central.connect(device.peripheral, options: nil)
+                let device = devices[selectedIndex]
+                self.selected = device.peripheral
+                self.logger.write("ble.selection", [
+                    "id": device.peripheral.identifier.uuidString,
+                    "name": device.name,
+                    "rssi": device.rssi,
+                    "candidate": device.candidate,
+                ])
+                print("Connecting to \(device.name)...")
+                self.startDiscoveryTimeout(reason: "connect_timeout")
+                self.central.connect(device.peripheral, options: nil)
+            }
+        }
+    }
+
+    private func checkSetupComplete() {
+        guard !setupComplete,
+              pendingServiceDiscoveries == 0,
+              pendingNotifyEnables.isEmpty
+        else { return }
+
+        setupComplete = true
+        printCaptureInstructions()
+    }
+
+    private func setupSignalHandlers() {
+        for signalNumber in [SIGINT, SIGTERM] {
+            signal(signalNumber, SIG_IGN)
+            let source = DispatchSource.makeSignalSource(signal: signalNumber, queue: .main)
+            source.setEventHandler { [weak self] in
+                guard let self else { exit(1) }
+                print("\nInterrupted. Closing log...")
+                self.logger.write("session.end", ["reason": "interrupted", "signal": signalNumber])
+                self.finish(1)
+            }
+            source.resume()
+            signalSources.append(source)
+        }
+    }
+
+    private func startDiscoveryTimeout(reason: String) {
+        discoveryTimeout?.invalidate()
+        discoveryTimeout = Timer.scheduledTimer(withTimeInterval: 25, repeats: false) { [weak self] _ in
+            guard let self else { return }
+            self.logger.write("session.end", ["reason": reason])
+            print("Timed out while preparing capture: \(reason)")
+            self.finish(1)
+        }
+    }
+
+    private func finish(_ code: Int32) -> Never {
+        discoveryTimeout?.invalidate()
+        fflush(stdout)
+        fflush(stderr)
+        logger.finish()
+        exit(code)
     }
 
     private func printCaptureInstructions() {
+        discoveryTimeout?.invalidate()
+        let hasTreadmillData = notifiedCharacteristics.contains { $0.hasSuffix("/2ACD") }
+        guard hasTreadmillData || !notifiedCharacteristics.isEmpty else {
+            logger.write("session.end", ["reason": "no_notifications_enabled"])
+            print("No notifications could be enabled on the selected device.")
+            finish(1)
+        }
+
+        if !hasTreadmillData {
+            print("Warning: FTMS Treadmill Data notifications were not enabled. The log may not include live treadmill stats.")
+            logger.write("capture.warning", ["reason": "missing_2ACD_notification"])
+        }
+
         print("")
         print("Capture is running. Stand off the belt for safety.")
-        print("Suggested script:")
-        print("1. Leave treadmill idle for 15 seconds.")
-        print("2. Start using the treadmill remote or panel, then wait 15 seconds.")
-        print("3. Set known speeds from the remote or panel, waiting 15 seconds each.")
-        print("4. Try incline levels if supported, waiting 15 seconds each.")
-        print("5. Stop the treadmill from the remote or panel.")
-        print("6. Press return here to disconnect and finish the log.")
+        print("The tool will ask you to press return at each step so the log has markers.")
         print("")
 
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            _ = readLine()
+            let steps: [(String, [String: Any])] = [
+                ("Leave the treadmill connected and idle for 15 seconds, then press return.", ["phase": "idle"]),
+                ("Start using the treadmill remote or panel. Wait 15 seconds, then press return.", ["phase": "remote_start"]),
+                ("Set speed to exactly 1.0 using the remote or panel. Wait 15 seconds, then press return.", ["phase": "speed", "speed": 1.0]),
+                ("Set speed to exactly 2.0 using the remote or panel. Wait 15 seconds, then press return.", ["phase": "speed", "speed": 2.0]),
+                ("Set speed to exactly 3.0 using the remote or panel. Wait 15 seconds, then press return.", ["phase": "speed", "speed": 3.0]),
+                ("If safe, set speed to exactly 4.0 using the remote or panel. Otherwise leave it unchanged. Wait 15 seconds, then press return.", ["phase": "speed", "speed": 4.0, "optional": true]),
+                ("If incline is supported, set incline to 1. Wait 15 seconds, then press return. Otherwise just press return.", ["phase": "incline", "incline": 1, "optional": true]),
+                ("If incline is supported, set incline to 2. Wait 15 seconds, then press return. Otherwise just press return.", ["phase": "incline", "incline": 2, "optional": true]),
+                ("If incline is supported, set incline back to 0. Wait 15 seconds, then press return. Otherwise just press return.", ["phase": "incline", "incline": 0, "optional": true]),
+                ("Stop the treadmill using the remote or panel. Wait 10 seconds, then press return to finish.", ["phase": "remote_stop"]),
+            ]
+
+            for (instruction, fields) in steps {
+                print(instruction)
+                self?.logger.write("user.marker.prompt", fields.merging(["instruction": instruction]) { current, _ in current })
+                _ = readLine()
+                self?.logger.write("user.marker.done", fields)
+            }
+
             DispatchQueue.main.async {
                 guard let self, let selected = self.selected else { return }
                 self.logger.write("user.finished_script", [:])
@@ -322,9 +451,63 @@ final class BLECapture: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
                 "requestOpcode": data.count >= 2 ? String(format: "0x%02X", data[1]) : "none",
                 "resultCode": data.count >= 3 ? String(format: "0x%02X", data[2]) : "none",
             ]
+        case CBUUID(string: "2ACC"):
+            return parseFitnessMachineFeature(data)
+        case CBUUID(string: "2AD4"):
+            return parseSupportedSpeedRange(data)
+        case CBUUID(string: "2AD5"):
+            return parseSupportedInclinationRange(data)
+        case CBUUID(string: "2A24"), CBUUID(string: "2A25"), CBUUID(string: "2A26"), CBUUID(string: "2A27"), CBUUID(string: "2A28"), CBUUID(string: "2A29"):
+            return ["utf8": String(data: data, encoding: .utf8) ?? "invalid_utf8"]
         default:
             return [:]
         }
+    }
+
+    private func parseFitnessMachineFeature(_ data: Data) -> [String: Any] {
+        guard data.count >= 8 else { return ["error": "short_packet"] }
+        let fitnessMachineFeatures = UInt32(data[0]) |
+            (UInt32(data[1]) << 8) |
+            (UInt32(data[2]) << 16) |
+            (UInt32(data[3]) << 24)
+        let targetSettingFeatures = UInt32(data[4]) |
+            (UInt32(data[5]) << 8) |
+            (UInt32(data[6]) << 16) |
+            (UInt32(data[7]) << 24)
+        return [
+            "fitnessMachineFeatures": String(format: "0x%08X", fitnessMachineFeatures),
+            "targetSettingFeatures": String(format: "0x%08X", targetSettingFeatures),
+        ]
+    }
+
+    private func parseSupportedSpeedRange(_ data: Data) -> [String: Any] {
+        guard data.count >= 6 else { return ["error": "short_packet"] }
+        let minimum = UInt16(data[0]) | (UInt16(data[1]) << 8)
+        let maximum = UInt16(data[2]) | (UInt16(data[3]) << 8)
+        let increment = UInt16(data[4]) | (UInt16(data[5]) << 8)
+        return [
+            "minimumRaw": minimum,
+            "maximumRaw": maximum,
+            "incrementRaw": increment,
+            "minimumKmh": Double(minimum) / 100.0,
+            "maximumKmh": Double(maximum) / 100.0,
+            "incrementKmh": Double(increment) / 100.0,
+        ]
+    }
+
+    private func parseSupportedInclinationRange(_ data: Data) -> [String: Any] {
+        guard data.count >= 6 else { return ["error": "short_packet"] }
+        let minimum = Int16(bitPattern: UInt16(data[0]) | (UInt16(data[1]) << 8))
+        let maximum = Int16(bitPattern: UInt16(data[2]) | (UInt16(data[3]) << 8))
+        let increment = UInt16(data[4]) | (UInt16(data[5]) << 8)
+        return [
+            "minimumRaw": minimum,
+            "maximumRaw": maximum,
+            "incrementRaw": increment,
+            "minimumPercent": Double(minimum) / 10.0,
+            "maximumPercent": Double(maximum) / 10.0,
+            "incrementPercent": Double(increment) / 10.0,
+        ]
     }
 
     private func parseTreadmillData(_ data: Data) -> [String: Any] {
@@ -332,13 +515,11 @@ final class BLECapture: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
 
         let flags = UInt16(data[0]) | (UInt16(data[1]) << 8)
         var offset = 2
-        let speedRaw = UInt16(data[offset]) | (UInt16(data[offset + 1]) << 8)
-        offset += 2
+        let moreData = flags & 0x0001 != 0
 
         var result: [String: Any] = [
             "flags": String(format: "0x%04X", flags),
-            "speedRaw": speedRaw,
-            "speedKmh": Double(speedRaw) / 100.0,
+            "moreData": moreData,
         ]
 
         func has(_ bit: UInt16) -> Bool { flags & bit != 0 }
@@ -357,6 +538,10 @@ final class BLECapture: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
             return Int(data[offset]) | (Int(data[offset + 1]) << 8) | (Int(data[offset + 2]) << 16)
         }
 
+        if let speedRaw = uint16() {
+            result["speedRaw"] = speedRaw
+            result["speedKmh"] = Double(speedRaw) / 100.0
+        }
         if has(0x0002), let averageSpeed = uint16() {
             result["averageSpeedKmh"] = Double(averageSpeed) / 100.0
         }
@@ -375,13 +560,11 @@ final class BLECapture: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
                 result["negativeElevationGainMeters"] = negative
             }
         }
-        if has(0x0020), offset + 1 <= data.count {
-            result["instantaneousPaceRaw"] = data[offset]
-            offset += 1
+        if has(0x0020), let pace = uint16() {
+            result["instantaneousPaceRaw"] = pace
         }
-        if has(0x0040), offset + 1 <= data.count {
-            result["averagePaceRaw"] = data[offset]
-            offset += 1
+        if has(0x0040), let pace = uint16() {
+            result["averagePaceRaw"] = pace
         }
         if has(0x0080), offset + 5 <= data.count {
             result["totalEnergyCalories"] = UInt16(data[offset]) | (UInt16(data[offset + 1]) << 8)
@@ -435,19 +618,20 @@ final class TraceLogger {
     let path: String
     private let handle: FileHandle
     private let start = Date()
-    private let encoder = JSONSerialization.self
     private let queue = DispatchQueue(label: "fi.zendit.TreadmillTrace.logger")
+    private let isoFormatter = ISO8601DateFormatter()
 
     init(outputPath: String?) {
         if let outputPath {
             path = NSString(string: outputPath).expandingTildeInPath
         } else {
             let formatter = DateFormatter()
+            formatter.locale = Locale(identifier: "en_US_POSIX")
             formatter.dateFormat = "yyyy-MM-dd_HH-mm-ss"
             path = FileManager.default.currentDirectoryPath + "/treadmill-trace-\(formatter.string(from: Date())).jsonl"
         }
 
-        FileManager.default.createFile(atPath: path, contents: nil)
+        FileManager.default.createFile(atPath: path, contents: Data())
         guard let handle = FileHandle(forWritingAtPath: path) else {
             fputs("Failed to create log file at \(path)\n", stderr)
             exit(1)
@@ -458,15 +642,22 @@ final class TraceLogger {
     func write(_ event: String, _ fields: [String: Any]) {
         var object = fields
         object["event"] = event
-        object["timestamp"] = ISO8601DateFormatter().string(from: Date())
+        object["timestamp"] = isoFormatter.string(from: Date())
         object["elapsedSeconds"] = Date().timeIntervalSince(start)
 
         queue.async { [handle] in
             guard JSONSerialization.isValidJSONObject(object),
                   let data = try? JSONSerialization.data(withJSONObject: object, options: [.sortedKeys])
             else { return }
-            handle.write(data)
-            handle.write(Data("\n".utf8))
+            try? handle.write(contentsOf: data)
+            try? handle.write(contentsOf: Data("\n".utf8))
+        }
+    }
+
+    func finish() {
+        queue.sync {
+            try? handle.synchronize()
+            try? handle.close()
         }
     }
 }
@@ -507,7 +698,11 @@ func describeAdvertisement(_ advertisementData: [String: Any]) -> [String: Any] 
         case let uuids as [CBUUID]:
             result[key] = uuids.map(\.uuidString)
         case let serviceData as [CBUUID: Data]:
-            result[key] = serviceData.mapValues { ["hex": $0.hexString, "base64": $0.base64EncodedString()] }
+            var converted: [String: Any] = [:]
+            for (uuid, data) in serviceData {
+                converted[uuid.uuidString] = ["hex": data.hexString, "base64": data.base64EncodedString()]
+            }
+            result[key] = converted
         default:
             result[key] = String(describing: value)
         }

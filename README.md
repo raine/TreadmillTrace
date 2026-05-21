@@ -30,10 +30,14 @@ Optional:
 
 1. Run the tool and choose the Vitalwalk/treadmill from the list.
 2. Stand off the belt for safety.
-3. Leave the treadmill idle for 15 seconds.
-4. Start the treadmill using the remote or panel, then wait 15 seconds.
-5. Set known speeds from the remote or panel, waiting 15 seconds each.
-6. Try incline levels if supported, waiting 15 seconds each.
-7. Stop the treadmill from the remote or panel.
-8. Press return in the tool to disconnect and finish the log.
-9. Send the generated `treadmill-trace-*.jsonl` file.
+3. Follow the prompts in the terminal.
+4. Use the treadmill remote or panel, not WalkingMate, during the capture.
+5. The tool will ask you to press return after exact steps like:
+   - idle for 15 seconds
+   - start from the remote or panel
+   - speed exactly 1.0, 2.0, 3.0, and optionally 4.0
+   - incline 1, 2, and back to 0 if supported
+   - stop from the remote or panel
+6. Send the generated `treadmill-trace-*.jsonl` file.
+
+Please also tell us whether the treadmill display was using km/h or mph.
