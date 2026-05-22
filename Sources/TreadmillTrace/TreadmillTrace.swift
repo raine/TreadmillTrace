@@ -64,6 +64,66 @@ final class BLECapture: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
     private var scanStarted = false
     private var discoveryTimeout: Timer?
     private var signalSources: [DispatchSourceSignal] = []
+    private var displayUnit = "unknown"
+    private var speedRange: SpeedRange?
+    private var inclineRange: InclineRange?
+    private var currentPhase: CapturePhase?
+    private var phaseStats: [String: PhaseStats] = [:]
+    private var totalTreadmillDataPackets = 0
+    private var sawNonzeroSpeed = false
+    private var sawDistanceIncrease = false
+    private var sawElapsedTimeIncrease = false
+    private var sawStatusTransition = false
+    private var lastDistanceMeters: Int?
+    private var lastElapsedTimeSeconds: UInt16?
+    private var lastMachineStatusOpcode: String?
+    private let phaseDuration: TimeInterval = 15
+    private let stopPhaseDuration: TimeInterval = 10
+    private let minimumPhaseSamples = 3
+
+    private struct SpeedRange {
+        let minimumKmh: Double
+        let maximumKmh: Double
+        let incrementKmh: Double
+
+        func contains(_ speed: Double) -> Bool {
+            speed >= minimumKmh && speed <= maximumKmh
+        }
+    }
+
+    private struct InclineRange {
+        let minimumPercent: Double
+        let maximumPercent: Double
+        let incrementPercent: Double
+
+        var isSupported: Bool {
+            minimumPercent != 0 || maximumPercent != 0 || incrementPercent != 0
+        }
+    }
+
+    private struct CapturePhase {
+        let id: String
+        let fields: [String: Any]
+        let startedAt: Date
+    }
+
+    private struct PhaseStats {
+        var treadmillDataPackets = 0
+        var nonzeroSpeedSamples = 0
+        var firstSpeedKmh: Double?
+        var lastSpeedKmh: Double?
+        var firstDistanceMeters: Int?
+        var lastDistanceMeters: Int?
+        var firstElapsedTimeSeconds: UInt16?
+        var lastElapsedTimeSeconds: UInt16?
+        var machineStatusOpcodes: Set<String> = []
+    }
+
+    private struct CaptureStep {
+        let instruction: String
+        let fields: [String: Any]
+        let duration: TimeInterval
+    }
 
     init(logger: TraceLogger, scanSeconds: TimeInterval) {
         self.logger = logger
@@ -262,18 +322,27 @@ final class BLECapture: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
     }
 
     func peripheral(_ peripheral: CBPeripheral, didUpdateValueFor characteristic: CBCharacteristic, error: Error?) {
+        let key = characteristicKey(characteristic)
+        let wasReadRequest = readRequests.remove(key) != nil
+        defer {
+            if wasReadRequest {
+                checkSetupComplete()
+            }
+        }
+
         if let error {
             logger.write("ble.rx_error", [
                 "service": characteristic.service?.uuid.uuidString ?? "unknown",
                 "characteristic": characteristic.uuid.uuidString,
+                "source": wasReadRequest ? "read" : "notify",
                 "error": error.localizedDescription,
             ])
             return
         }
 
         guard let data = characteristic.value else { return }
-        let key = characteristicKey(characteristic)
-        let wasReadRequest = readRequests.remove(key) != nil
+        let ftms = parseFTMSIfKnown(characteristic: characteristic, data: data)
+        updateCaptureState(characteristic: characteristic, ftms: ftms)
         logger.write("ble.rx", [
             "service": characteristic.service?.uuid.uuidString ?? "unknown",
             "characteristic": characteristic.uuid.uuidString,
@@ -281,12 +350,96 @@ final class BLECapture: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
             "length": data.count,
             "hex": data.hexString,
             "base64": data.base64EncodedString(),
-            "ftms": parseFTMSIfKnown(characteristic: characteristic, data: data),
+            "ftms": ftms,
         ])
     }
 
     private func characteristicKey(_ characteristic: CBCharacteristic) -> String {
         "\(characteristic.service?.uuid.uuidString ?? "unknown")/\(characteristic.uuid.uuidString)"
+    }
+
+    private func updateCaptureState(characteristic: CBCharacteristic, ftms: [String: Any]) {
+        switch characteristic.uuid {
+        case CBUUID(string: "2ACD"):
+            updateTreadmillDataState(ftms)
+        case CBUUID(string: "2ADA"):
+            updateMachineStatusState(ftms)
+        case CBUUID(string: "2AD4"):
+            if let minimumKmh = ftms["minimumKmh"] as? Double,
+               let maximumKmh = ftms["maximumKmh"] as? Double,
+               let incrementKmh = ftms["incrementKmh"] as? Double
+            {
+                speedRange = SpeedRange(minimumKmh: minimumKmh, maximumKmh: maximumKmh, incrementKmh: incrementKmh)
+            }
+        case CBUUID(string: "2AD5"):
+            if let minimumPercent = ftms["minimumPercent"] as? Double,
+               let maximumPercent = ftms["maximumPercent"] as? Double,
+               let incrementPercent = ftms["incrementPercent"] as? Double
+            {
+                inclineRange = InclineRange(
+                    minimumPercent: minimumPercent,
+                    maximumPercent: maximumPercent,
+                    incrementPercent: incrementPercent
+                )
+            }
+        default:
+            break
+        }
+    }
+
+    private func updateTreadmillDataState(_ ftms: [String: Any]) {
+        totalTreadmillDataPackets += 1
+
+        let speedKmh = ftms["speedKmh"] as? Double
+        let distanceMeters = ftms["totalDistanceMeters"] as? Int
+        let elapsedTimeSeconds = ftms["elapsedTimeSeconds"] as? UInt16
+
+        if let speedKmh, speedKmh > 0 {
+            sawNonzeroSpeed = true
+        }
+        if let distanceMeters {
+            if let previous = lastDistanceMeters, distanceMeters > previous {
+                sawDistanceIncrease = true
+            }
+            lastDistanceMeters = distanceMeters
+        }
+        if let elapsedTimeSeconds {
+            if let previous = lastElapsedTimeSeconds, elapsedTimeSeconds > previous {
+                sawElapsedTimeIncrease = true
+            }
+            lastElapsedTimeSeconds = elapsedTimeSeconds
+        }
+
+        guard let phase = currentPhase else { return }
+        var stats = phaseStats[phase.id] ?? PhaseStats()
+        stats.treadmillDataPackets += 1
+        if let speedKmh {
+            if stats.firstSpeedKmh == nil { stats.firstSpeedKmh = speedKmh }
+            stats.lastSpeedKmh = speedKmh
+            if speedKmh > 0 { stats.nonzeroSpeedSamples += 1 }
+        }
+        if let distanceMeters {
+            if stats.firstDistanceMeters == nil { stats.firstDistanceMeters = distanceMeters }
+            stats.lastDistanceMeters = distanceMeters
+        }
+        if let elapsedTimeSeconds {
+            if stats.firstElapsedTimeSeconds == nil { stats.firstElapsedTimeSeconds = elapsedTimeSeconds }
+            stats.lastElapsedTimeSeconds = elapsedTimeSeconds
+        }
+        phaseStats[phase.id] = stats
+    }
+
+    private func updateMachineStatusState(_ ftms: [String: Any]) {
+        guard let opcode = ftms["machineStatusOpcode"] as? String else { return }
+        if let previous = lastMachineStatusOpcode, previous != opcode {
+            sawStatusTransition = true
+        }
+        lastMachineStatusOpcode = opcode
+
+        guard let phase = currentPhase else { return }
+        var stats = phaseStats[phase.id] ?? PhaseStats()
+        stats.machineStatusOpcodes.insert(opcode)
+        phaseStats[phase.id] = stats
     }
 
     private func finishScan() {
@@ -349,7 +502,16 @@ final class BLECapture: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
         else { return }
 
         setupComplete = true
-        printCaptureInstructions()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { [weak self] in
+            guard let self else { return }
+            if !self.readRequests.isEmpty {
+                self.logger.write("capture.warning", [
+                    "reason": "read_requests_incomplete",
+                    "pendingReads": Array(self.readRequests).sorted(),
+                ])
+            }
+            self.printCaptureInstructions()
+        }
     }
 
     private func setupSignalHandlers() {
@@ -401,36 +563,179 @@ final class BLECapture: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
 
         print("")
         print("Capture is running. Stand off the belt for safety.")
-        print("The tool will ask you to press return at each step so the log has markers.")
+        print("Press return when each requested treadmill state is ready. The tool will then record a timed sample automatically.")
         print("")
 
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            let steps: [(String, [String: Any])] = [
-                ("Leave the treadmill connected and idle for 15 seconds, then press return.", ["phase": "idle"]),
-                ("Start using the treadmill remote or panel. Wait 15 seconds, then press return.", ["phase": "remote_start"]),
-                ("Set speed to exactly 1.0 using the remote or panel. Wait 15 seconds, then press return.", ["phase": "speed", "speed": 1.0]),
-                ("Set speed to exactly 2.0 using the remote or panel. Wait 15 seconds, then press return.", ["phase": "speed", "speed": 2.0]),
-                ("Set speed to exactly 3.0 using the remote or panel. Wait 15 seconds, then press return.", ["phase": "speed", "speed": 3.0]),
-                ("If safe, set speed to exactly 4.0 using the remote or panel. Otherwise leave it unchanged. Wait 15 seconds, then press return.", ["phase": "speed", "speed": 4.0, "optional": true]),
-                ("If incline is supported, set incline to 1. Wait 15 seconds, then press return. Otherwise just press return.", ["phase": "incline", "incline": 1, "optional": true]),
-                ("If incline is supported, set incline to 2. Wait 15 seconds, then press return. Otherwise just press return.", ["phase": "incline", "incline": 2, "optional": true]),
-                ("If incline is supported, set incline back to 0. Wait 15 seconds, then press return. Otherwise just press return.", ["phase": "incline", "incline": 0, "optional": true]),
-                ("Stop the treadmill using the remote or panel. Wait 10 seconds, then press return to finish.", ["phase": "remote_stop"]),
-            ]
+            guard let self else { return }
+            self.collectDisplayUnit()
+            let steps = self.buildCaptureSteps()
 
-            for (instruction, fields) in steps {
-                print(instruction)
-                self?.logger.write("user.marker.prompt", fields.merging(["instruction": instruction]) { current, _ in current })
-                _ = readLine()
-                self?.logger.write("user.marker.done", fields)
+            for step in steps {
+                self.run(step: step)
             }
 
             DispatchQueue.main.async {
-                guard let self, let selected = self.selected else { return }
+                guard let selected = self.selected else { return }
+                self.logCaptureQuality()
                 self.logger.write("user.finished_script", [:])
                 self.central.cancelPeripheralConnection(selected)
             }
         }
+    }
+
+    private func collectDisplayUnit() {
+        print("Which unit does the treadmill display use? Type kmh, mph, or press return if unknown:")
+        let input = readLine()?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? ""
+        if ["kmh", "km/h", "kph"].contains(input) {
+            displayUnit = "kmh"
+        } else if input == "mph" {
+            displayUnit = "mph"
+        } else {
+            displayUnit = "unknown"
+        }
+        logger.write("user.context", ["displayUnit": displayUnit])
+    }
+
+    private func buildCaptureSteps() -> [CaptureStep] {
+        var steps: [CaptureStep] = [
+            CaptureStep(
+                instruction: "Leave the treadmill connected and idle, then press return to record 15 seconds.",
+                fields: ["phase": "idle"],
+                duration: phaseDuration
+            ),
+            CaptureStep(
+                instruction: "Start using the treadmill remote or panel, then press return to record 15 seconds.",
+                fields: ["phase": "remote_start"],
+                duration: phaseDuration
+            ),
+        ]
+
+        let candidateDisplaySpeeds = [1.0, 2.0, 3.0, 4.0]
+        var speedSteps = candidateDisplaySpeeds.map { displaySpeed in
+            let targetKmh = displayUnit == "mph" ? displaySpeed * 1.609_344 : displaySpeed
+            return (displaySpeed: displaySpeed, targetKmh: targetKmh)
+        }
+        if let speedRange {
+            speedSteps = speedSteps.filter { speedRange.contains($0.targetKmh) }
+            if speedSteps.isEmpty {
+                logger.write("capture.warning", [
+                    "reason": "no_candidate_speeds_in_range",
+                    "minimumKmh": speedRange.minimumKmh,
+                    "maximumKmh": speedRange.maximumKmh,
+                    "displayUnit": displayUnit,
+                ])
+                let midpoint = ((speedRange.minimumKmh + speedRange.maximumKmh) / 2.0 * 10).rounded() / 10
+                let displaySpeed = displayUnit == "mph" ? midpoint / 1.609_344 : midpoint
+                speedSteps = [(displaySpeed: displaySpeed, targetKmh: midpoint)]
+            }
+        }
+        logger.write("capture.plan", [
+            "displayUnit": displayUnit,
+            "speedRange": speedRange.map { ["minimumKmh": $0.minimumKmh, "maximumKmh": $0.maximumKmh, "incrementKmh": $0.incrementKmh] } ?? NSNull(),
+            "inclineRange": inclineRange.map { ["minimumPercent": $0.minimumPercent, "maximumPercent": $0.maximumPercent, "incrementPercent": $0.incrementPercent] } ?? NSNull(),
+            "speeds": speedSteps.map { ["displaySpeed": $0.displaySpeed, "targetKmh": $0.targetKmh] },
+            "includesIncline": inclineRange?.isSupported ?? true,
+        ])
+
+        for speed in speedSteps {
+            let unitLabel = displayUnit == "mph" ? "mph" : "km/h"
+            steps.append(CaptureStep(
+                instruction: "Set speed to exactly \(format(speed.displaySpeed)) \(unitLabel) using the remote or panel, then press return to record 15 seconds.",
+                fields: [
+                    "phase": "speed",
+                    "displaySpeed": speed.displaySpeed,
+                    "displayUnit": displayUnit,
+                    "targetSpeedKmh": speed.targetKmh,
+                ],
+                duration: phaseDuration
+            ))
+        }
+
+        if inclineRange?.isSupported ?? true {
+            for incline in [1.0, 2.0, 0.0] {
+                steps.append(CaptureStep(
+                    instruction: "If incline is supported, set incline to \(incline), then press return to record 15 seconds. Otherwise press return to skip this timed sample.",
+                    fields: ["phase": "incline", "incline": incline, "optional": true],
+                    duration: phaseDuration
+                ))
+            }
+        } else {
+            logger.write("phase.skipped", ["phase": "incline", "reason": "unsupported_by_range"])
+            print("Skipping incline steps because the treadmill reports no supported incline range.")
+        }
+
+        steps.append(CaptureStep(
+            instruction: "Stop the treadmill using the remote or panel, then press return to record 10 seconds.",
+            fields: ["phase": "remote_stop"],
+            duration: stopPhaseDuration
+        ))
+        return steps
+    }
+
+    private func run(step: CaptureStep) {
+        print(step.instruction)
+        _ = readLine()
+
+        let phaseId = UUID().uuidString
+        let fields = step.fields.merging(["phaseId": phaseId, "durationSeconds": step.duration]) { current, _ in current }
+        DispatchQueue.main.sync {
+            currentPhase = CapturePhase(id: phaseId, fields: fields, startedAt: Date())
+            phaseStats[phaseId] = PhaseStats()
+        }
+        logger.write("phase.begin", fields)
+
+        Thread.sleep(forTimeInterval: step.duration)
+
+        let summary = DispatchQueue.main.sync { finishCurrentPhase(phaseId: phaseId) }
+        logger.write("phase.summary", summary)
+    }
+
+    private func finishCurrentPhase(phaseId: String) -> [String: Any] {
+        let stats = phaseStats[phaseId] ?? PhaseStats()
+        currentPhase = nil
+
+        let distanceIncreased = if let first = stats.firstDistanceMeters, let last = stats.lastDistanceMeters {
+            last > first
+        } else {
+            false
+        }
+        let elapsedIncreased = if let first = stats.firstElapsedTimeSeconds, let last = stats.lastElapsedTimeSeconds {
+            last > first
+        } else {
+            false
+        }
+
+        return [
+            "phaseId": phaseId,
+            "treadmillDataPackets": stats.treadmillDataPackets,
+            "nonzeroSpeedSamples": stats.nonzeroSpeedSamples,
+            "firstSpeedKmh": stats.firstSpeedKmh ?? NSNull(),
+            "lastSpeedKmh": stats.lastSpeedKmh ?? NSNull(),
+            "distanceIncreased": distanceIncreased,
+            "elapsedTimeIncreased": elapsedIncreased,
+            "machineStatusOpcodes": Array(stats.machineStatusOpcodes).sorted(),
+            "hasEnoughSamples": stats.treadmillDataPackets >= minimumPhaseSamples,
+        ]
+    }
+
+    private func logCaptureQuality() {
+        let shortPhases = phaseStats.values.filter { $0.treadmillDataPackets < minimumPhaseSamples }.count
+        logger.write("capture.quality", [
+            "displayUnit": displayUnit,
+            "treadmillDataPackets": totalTreadmillDataPackets,
+            "sawNonzeroSpeed": sawNonzeroSpeed,
+            "sawDistanceIncrease": sawDistanceIncrease,
+            "sawElapsedTimeIncrease": sawElapsedTimeIncrease,
+            "sawStatusTransition": sawStatusTransition,
+            "shortPhases": shortPhases,
+            "phaseCount": phaseStats.count,
+            "actionable": totalTreadmillDataPackets > 0 && (sawNonzeroSpeed || sawDistanceIncrease || sawElapsedTimeIncrease || sawStatusTransition),
+        ])
+    }
+
+    private func format(_ value: Double) -> String {
+        String(format: "%.1f", value)
     }
 
     private func isLikelyTreadmill(name: String, services: [CBUUID], serviceData: [CBUUID: Data]) -> Bool {
@@ -538,7 +843,7 @@ final class BLECapture: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
             return Int(data[offset]) | (Int(data[offset + 1]) << 8) | (Int(data[offset + 2]) << 16)
         }
 
-        if let speedRaw = uint16() {
+        if !moreData, let speedRaw = uint16() {
             result["speedRaw"] = speedRaw
             result["speedKmh"] = Double(speedRaw) / 100.0
         }
