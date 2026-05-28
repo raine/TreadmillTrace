@@ -15,6 +15,9 @@ struct TreadmillTrace {
 struct Arguments {
     var outputPath: String?
     var scanSeconds: TimeInterval = 12
+    var r3ProbeDuration: TimeInterval = 30
+    var r3ControlTests = false
+    var r3ControlTestsConfirmed = false
     var mode: CaptureMode = .guidedCapture
 
     static func parse(_ args: ArraySlice<String>) -> Arguments {
@@ -24,11 +27,17 @@ struct Arguments {
         while let arg = iterator.next() {
             switch arg {
             case "r3-probe":
-                result.mode = .r3Probe(duration: 30)
+                result.mode = .r3Probe(duration: result.r3ProbeDuration, controlTests: result.r3ControlTests)
             case "--duration":
                 if let value = iterator.next(), let seconds = TimeInterval(value) {
-                    result.mode = .r3Probe(duration: seconds)
+                    result.r3ProbeDuration = seconds
+                    result.mode = .r3Probe(duration: seconds, controlTests: result.r3ControlTests)
                 }
+            case "--control-tests":
+                result.r3ControlTests = true
+                result.mode = .r3Probe(duration: result.r3ProbeDuration, controlTests: true)
+            case "--i-understand-this-may-move-the-belt":
+                result.r3ControlTestsConfirmed = true
             case "--output", "-o":
                 result.outputPath = iterator.next()
             case "--scan-seconds":
@@ -42,16 +51,23 @@ struct Arguments {
                 Usage:
                   treadmill-trace [--output path] [--scan-seconds 12]
                   treadmill-trace r3-probe [--duration 30] [--output path] [--scan-seconds 12]
+                  treadmill-trace r3-probe --control-tests --i-understand-this-may-move-the-belt
 
                 The default capture asks you to drive the treadmill with the remote or panel.
                 r3-probe runs a safe WalkingPad R3 diagnostic. It discovers services,
                 subscribes to telemetry, sends only FTMS Request Control, and prints a
-                copy-pasteable report. It does not start the belt or change speed.
+                copy-pasteable report. It does not start the belt or change speed unless
+                the explicit --control-tests confirmation flag is also provided.
                 """)
                 exit(0)
             default:
                 break
             }
+        }
+
+        if result.r3ControlTests, !result.r3ControlTestsConfirmed {
+            fputs("--control-tests requires --i-understand-this-may-move-the-belt\n", stderr)
+            exit(2)
         }
 
         return result
@@ -60,7 +76,7 @@ struct Arguments {
 
 enum CaptureMode {
     case guidedCapture
-    case r3Probe(duration: TimeInterval)
+    case r3Probe(duration: TimeInterval, controlTests: Bool)
 }
 
 final class BLECapture: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
@@ -187,7 +203,7 @@ final class BLECapture: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
     private var modeName: String {
         switch mode {
         case .guidedCapture: "guidedCapture"
-        case .r3Probe: "r3Probe"
+        case let .r3Probe(_, controlTests): controlTests ? "r3ProbeControlTests" : "r3Probe"
         }
     }
 
@@ -610,18 +626,23 @@ final class BLECapture: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
             switch self.mode {
             case .guidedCapture:
                 self.printCaptureInstructions()
-            case let .r3Probe(duration):
-                self.startR3Probe(duration: duration)
+            case let .r3Probe(duration, controlTests):
+                self.startR3Probe(duration: duration, controlTests: controlTests)
             }
         }
     }
 
-    private func startR3Probe(duration: TimeInterval) {
+    private func startR3Probe(duration: TimeInterval, controlTests: Bool) {
         discoveryTimeout?.invalidate()
         print("")
         print("R3 probe is running for \(Int(duration)) seconds.")
-        print("This safe probe will not start the belt or change speed.")
-        print("It sends only FTMS Request Control (00) to test whether the device responds.")
+        if controlTests {
+            print("Control tests are enabled. Commands in this mode may start or stop the belt.")
+            print("Stand off the treadmill and keep the remote or safety stop ready.")
+        } else {
+            print("This safe probe will not start the belt or change speed.")
+            print("It sends only FTMS Request Control (00) to test whether the device responds.")
+        }
         print("")
 
         if let selected, let controlPoint = findCharacteristic(uuid: CBUUID(string: "2AD9"), in: selected) {
@@ -638,15 +659,25 @@ final class BLECapture: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
             logger.write("r3_probe.control_point_missing", [:])
         }
 
-        Timer.scheduledTimer(withTimeInterval: duration, repeats: false) { [weak self] _ in
-            guard let self else { return }
-            self.printR3ProbeReport()
-            self.logger.write("r3_probe.summary", self.r3ProbeSummary())
-            if let selected = self.selected {
-                self.central.cancelPeripheralConnection(selected)
-            } else {
-                self.finish(0)
+        if controlTests {
+            DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+                self?.runR3ControlTests()
             }
+        } else {
+            Timer.scheduledTimer(withTimeInterval: duration, repeats: false) { [weak self] _ in
+                guard let self else { return }
+                self.finishR3Probe()
+            }
+        }
+    }
+
+    private func finishR3Probe() {
+        printR3ProbeReport()
+        logger.write("r3_probe.summary", r3ProbeSummary())
+        if let selected {
+            central.cancelPeripheralConnection(selected)
+        } else {
+            finish(0)
         }
     }
 
@@ -654,6 +685,98 @@ final class BLECapture: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
         peripheral.services?
             .flatMap { $0.characteristics ?? [] }
             .first { $0.uuid == uuid }
+    }
+
+    private struct R3ControlCommand {
+        let name: String
+        let hex: [UInt8]
+        let waitSeconds: TimeInterval
+        let prompt: String
+    }
+
+    private func runR3ControlTests() {
+        guard let selected, let controlPoint = findCharacteristic(uuid: CBUUID(string: "2AD9"), in: selected) else {
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                print("No FTMS Control Point (2AD9) found. Control tests cannot run.")
+                self.finishR3Probe()
+            }
+            return
+        }
+
+        print("")
+        print("CONTROL TESTS MAY MOVE THE BELT.")
+        print("Confirm the treadmill is clear, you are standing off the belt, and you can stop it immediately.")
+        print("Type RUN to continue, anything else to skip control tests:")
+        guard (readLine() ?? "").trimmingCharacters(in: .whitespacesAndNewlines) == "RUN" else {
+            logger.write("r3_probe.control_tests_skipped", ["reason": "user_declined_runtime_confirmation"])
+            DispatchQueue.main.async { [weak self] in self?.finishR3Probe() }
+            return
+        }
+
+        let commands = [
+            R3ControlCommand(
+                name: "ftms_request_control",
+                hex: [0x00],
+                waitSeconds: 5,
+                prompt: "Did anything visible happen after Request Control?"
+            ),
+            R3ControlCommand(
+                name: "ftms_start_resume",
+                hex: [0x07],
+                waitSeconds: 6,
+                prompt: "Did the belt start or did the treadmill display change?"
+            ),
+            R3ControlCommand(
+                name: "ftms_set_speed_1_0_kmh",
+                hex: [0x02, 0x64, 0x00],
+                waitSeconds: 6,
+                prompt: "Did speed change to 1.0 km/h or did the display acknowledge it?"
+            ),
+            R3ControlCommand(
+                name: "ftms_pause",
+                hex: [0x08, 0x02],
+                waitSeconds: 6,
+                prompt: "Did the treadmill pause or stop?"
+            ),
+            R3ControlCommand(
+                name: "ftms_stop",
+                hex: [0x08, 0x01],
+                waitSeconds: 6,
+                prompt: "Did the treadmill stop?"
+            ),
+        ]
+
+        logger.write("r3_probe.control_tests_begin", ["commandCount": commands.count])
+        for command in commands {
+            print("")
+            print("About to send \(command.name): \(Data(command.hex).hexString)")
+            print("Press return to send, or type skip to skip this command:")
+            if (readLine() ?? "").trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "skip" {
+                logger.write("r3_probe.control_test_skipped", ["command": command.name])
+                continue
+            }
+
+            DispatchQueue.main.sync {
+                logger.write("r3_probe.control_test_tx", ["command": command.name, "hex": Data(command.hex).hexString])
+                selected.writeValue(Data(command.hex), for: controlPoint, type: .withResponse)
+            }
+            Thread.sleep(forTimeInterval: command.waitSeconds)
+
+            print(command.prompt)
+            print("Type what happened, or press return for no visible change:")
+            let observation = readLine()?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            logger.write("r3_probe.control_test_observation", [
+                "command": command.name,
+                "hex": Data(command.hex).hexString,
+                "observation": observation.isEmpty ? "no visible change" : observation,
+            ])
+        }
+        logger.write("r3_probe.control_tests_end", [:])
+
+        DispatchQueue.main.async { [weak self] in
+            self?.finishR3Probe()
+        }
     }
 
     private func printR3ProbeReport() {
