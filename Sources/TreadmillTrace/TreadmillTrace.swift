@@ -7,7 +7,7 @@ struct TreadmillTrace {
     static func main() {
         let arguments = Arguments.parse(CommandLine.arguments.dropFirst())
         let logger = TraceLogger(outputPath: arguments.outputPath)
-        let capture = BLECapture(logger: logger, scanSeconds: arguments.scanSeconds)
+        let capture = BLECapture(logger: logger, scanSeconds: arguments.scanSeconds, mode: arguments.mode)
         capture.run()
     }
 }
@@ -15,6 +15,7 @@ struct TreadmillTrace {
 struct Arguments {
     var outputPath: String?
     var scanSeconds: TimeInterval = 12
+    var mode: CaptureMode = .guidedCapture
 
     static func parse(_ args: ArraySlice<String>) -> Arguments {
         var result = Arguments()
@@ -22,6 +23,12 @@ struct Arguments {
 
         while let arg = iterator.next() {
             switch arg {
+            case "r3-probe":
+                result.mode = .r3Probe(duration: 30)
+            case "--duration":
+                if let value = iterator.next(), let seconds = TimeInterval(value) {
+                    result.mode = .r3Probe(duration: seconds)
+                }
             case "--output", "-o":
                 result.outputPath = iterator.next()
             case "--scan-seconds":
@@ -34,10 +41,12 @@ struct Arguments {
 
                 Usage:
                   treadmill-trace [--output path] [--scan-seconds 12]
+                  treadmill-trace r3-probe [--duration 30] [--output path] [--scan-seconds 12]
 
-                The tool scans for nearby BLE devices, lets you choose one, connects,
-                discovers services and characteristics, subscribes to notify/indicate
-                characteristics, and writes JSON Lines trace events.
+                The default capture asks you to drive the treadmill with the remote or panel.
+                r3-probe runs a safe WalkingPad R3 diagnostic. It discovers services,
+                subscribes to telemetry, sends only FTMS Request Control, and prints a
+                copy-pasteable report. It does not start the belt or change speed.
                 """)
                 exit(0)
             default:
@@ -49,9 +58,15 @@ struct Arguments {
     }
 }
 
+enum CaptureMode {
+    case guidedCapture
+    case r3Probe(duration: TimeInterval)
+}
+
 final class BLECapture: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
     private let logger: TraceLogger
     private let scanSeconds: TimeInterval
+    private let mode: CaptureMode
     private var central: CBCentralManager!
     private var discovered: [UUID: DiscoveredPeripheral] = [:]
     private var selected: CBPeripheral?
@@ -70,6 +85,7 @@ final class BLECapture: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
     private var currentPhase: CapturePhase?
     private var phaseStats: [String: PhaseStats] = [:]
     private var totalTreadmillDataPackets = 0
+    private var r3ProbeState = R3ProbeState()
     private var sawNonzeroSpeed = false
     private var sawDistanceIncrease = false
     private var sawElapsedTimeIncrease = false
@@ -125,24 +141,54 @@ final class BLECapture: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
         let duration: TimeInterval
     }
 
-    init(logger: TraceLogger, scanSeconds: TimeInterval) {
+    private struct R3ProbeState {
+        var discoveredServices: Set<String> = []
+        var discoveredCharacteristics: [String: [String]] = [:]
+        var notifyingCharacteristics: Set<String> = []
+        var readableCharacteristics: Set<String> = []
+        var readValues: [String: String] = [:]
+        var treadmillDataPackets = 0
+        var treadmillSamples: [[String: Any]] = []
+        var machineStatusPackets = 0
+        var trainingStatusPackets = 0
+        var controlPointResponses: [[String: Any]] = []
+        var controlPointWriteError: String?
+        var controlPointWriteCompleted = false
+        var controlPointRequestSent = false
+        var supplementNotifications: [[String: String]] = []
+        var vendorServices: Set<String> = []
+    }
+
+    init(logger: TraceLogger, scanSeconds: TimeInterval, mode: CaptureMode) {
         self.logger = logger
         self.scanSeconds = scanSeconds
+        self.mode = mode
         super.init()
     }
 
     func run() {
         print("TreadmillTrace")
+        if case .r3Probe = mode {
+            print("Mode: R3 safe diagnostic probe")
+        }
         print("Log: \(logger.path)")
         print("Scanning for \(Int(scanSeconds)) seconds...")
         print("")
         logger.write("session.start", [
             "tool": "TreadmillTrace",
+            "mode": modeName,
             "os": ProcessInfo.processInfo.operatingSystemVersionString,
         ])
         setupSignalHandlers()
         central = CBCentralManager(delegate: self, queue: nil)
         RunLoop.main.run()
+    }
+
+    private var modeName: String {
+        switch mode {
+        case .guidedCapture: "guidedCapture"
+        case .r3Probe: "r3Probe"
+        }
     }
 
     func centralManagerDidUpdateState(_ central: CBCentralManager) {
@@ -280,6 +326,13 @@ final class BLECapture: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
         }
 
         let characteristics = service.characteristics ?? []
+        r3ProbeState.discoveredServices.insert(service.uuid.uuidString)
+        r3ProbeState.discoveredCharacteristics[service.uuid.uuidString] = characteristics.map { characteristic in
+            "\(characteristic.uuid.uuidString): \(describe(characteristic.properties).joined(separator: ","))"
+        }
+        if isKnownR3SupplementService(service.uuid) {
+            r3ProbeState.vendorServices.insert(service.uuid.uuidString)
+        }
         logger.write("ble.characteristics", [
             "service": service.uuid.uuidString,
             "count": characteristics.count,
@@ -298,7 +351,9 @@ final class BLECapture: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
             }
 
             if characteristic.properties.contains(.read) {
-                readRequests.insert(characteristicKey(characteristic))
+                let key = characteristicKey(characteristic)
+                readRequests.insert(key)
+                r3ProbeState.readableCharacteristics.insert(key)
                 peripheral.readValue(for: characteristic)
             }
         }
@@ -310,6 +365,7 @@ final class BLECapture: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
         pendingNotifyEnables.remove(key)
         if characteristic.isNotifying {
             notifiedCharacteristics.insert(key)
+            r3ProbeState.notifyingCharacteristics.insert(key)
         }
 
         logger.write("ble.notify_state", [
@@ -343,6 +399,7 @@ final class BLECapture: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
         guard let data = characteristic.value else { return }
         let ftms = parseFTMSIfKnown(characteristic: characteristic, data: data)
         updateCaptureState(characteristic: characteristic, ftms: ftms)
+        updateR3ProbeState(characteristic: characteristic, data: data, ftms: ftms, wasReadRequest: wasReadRequest)
         logger.write("ble.rx", [
             "service": characteristic.service?.uuid.uuidString ?? "unknown",
             "characteristic": characteristic.uuid.uuidString,
@@ -354,8 +411,48 @@ final class BLECapture: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
         ])
     }
 
+    func peripheral(_: CBPeripheral, didWriteValueFor characteristic: CBCharacteristic, error: Error?) {
+        guard characteristic.uuid == CBUUID(string: "2AD9") else { return }
+        r3ProbeState.controlPointWriteCompleted = error == nil
+        r3ProbeState.controlPointWriteError = error?.localizedDescription
+        logger.write("r3_probe.control_point_write", [
+            "service": characteristic.service?.uuid.uuidString ?? "unknown",
+            "characteristic": characteristic.uuid.uuidString,
+            "error": error?.localizedDescription ?? "none",
+        ])
+    }
+
     private func characteristicKey(_ characteristic: CBCharacteristic) -> String {
         "\(characteristic.service?.uuid.uuidString ?? "unknown")/\(characteristic.uuid.uuidString)"
+    }
+
+    private func updateR3ProbeState(characteristic: CBCharacteristic, data: Data, ftms: [String: Any], wasReadRequest: Bool) {
+        let key = characteristicKey(characteristic)
+        if wasReadRequest {
+            r3ProbeState.readValues[key] = data.hexString
+        }
+
+        switch characteristic.uuid {
+        case CBUUID(string: "2ACD"):
+            r3ProbeState.treadmillDataPackets += 1
+            if r3ProbeState.treadmillSamples.count < 5 {
+                r3ProbeState.treadmillSamples.append(ftms.merging(["hex": data.hexString]) { current, _ in current })
+            }
+        case CBUUID(string: "2AD3"):
+            r3ProbeState.trainingStatusPackets += 1
+        case CBUUID(string: "2ADA"):
+            r3ProbeState.machineStatusPackets += 1
+        case CBUUID(string: "2AD9"):
+            r3ProbeState.controlPointResponses.append(ftms.merging(["hex": data.hexString]) { current, _ in current })
+        default:
+            if isKnownR3SupplementService(characteristic.service?.uuid), !wasReadRequest {
+                r3ProbeState.supplementNotifications.append([
+                    "service": characteristic.service?.uuid.uuidString ?? "unknown",
+                    "characteristic": characteristic.uuid.uuidString,
+                    "hex": data.hexString,
+                ])
+            }
+        }
     }
 
     private func updateCaptureState(characteristic: CBCharacteristic, ftms: [String: Any]) {
@@ -510,8 +607,135 @@ final class BLECapture: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
                     "pendingReads": Array(self.readRequests).sorted(),
                 ])
             }
-            self.printCaptureInstructions()
+            switch self.mode {
+            case .guidedCapture:
+                self.printCaptureInstructions()
+            case let .r3Probe(duration):
+                self.startR3Probe(duration: duration)
+            }
         }
+    }
+
+    private func startR3Probe(duration: TimeInterval) {
+        discoveryTimeout?.invalidate()
+        print("")
+        print("R3 probe is running for \(Int(duration)) seconds.")
+        print("This safe probe will not start the belt or change speed.")
+        print("It sends only FTMS Request Control (00) to test whether the device responds.")
+        print("")
+
+        if let selected, let controlPoint = findCharacteristic(uuid: CBUUID(string: "2AD9"), in: selected) {
+            print("Sending FTMS Request Control to 2AD9...")
+            r3ProbeState.controlPointRequestSent = true
+            logger.write("r3_probe.control_point_request", [
+                "service": controlPoint.service?.uuid.uuidString ?? "unknown",
+                "characteristic": controlPoint.uuid.uuidString,
+                "hex": "00",
+            ])
+            selected.writeValue(Data([0x00]), for: controlPoint, type: .withResponse)
+        } else {
+            print("No FTMS Control Point (2AD9) found.")
+            logger.write("r3_probe.control_point_missing", [:])
+        }
+
+        Timer.scheduledTimer(withTimeInterval: duration, repeats: false) { [weak self] _ in
+            guard let self else { return }
+            self.printR3ProbeReport()
+            self.logger.write("r3_probe.summary", self.r3ProbeSummary())
+            if let selected = self.selected {
+                self.central.cancelPeripheralConnection(selected)
+            } else {
+                self.finish(0)
+            }
+        }
+    }
+
+    private func findCharacteristic(uuid: CBUUID, in peripheral: CBPeripheral) -> CBCharacteristic? {
+        peripheral.services?
+            .flatMap { $0.characteristics ?? [] }
+            .first { $0.uuid == uuid }
+    }
+
+    private func printR3ProbeReport() {
+        let summary = r3ProbeSummary()
+        print("")
+        print("===== TreadmillTrace R3 Probe Report =====")
+        print("Log file: \(logger.path)")
+        print("Device: \(selected?.name ?? "Unknown")")
+        print("Device ID: \(selected?.identifier.uuidString ?? "unknown")")
+        print("FTMS service present: \(yesNo(r3ProbeState.discoveredServices.contains("1826")))")
+        print("FTMS data stream works: \(yesNo(r3ProbeState.treadmillDataPackets > 0)) (packets: \(r3ProbeState.treadmillDataPackets))")
+        print("FTMS Request Control sent: \(yesNo(r3ProbeState.controlPointRequestSent))")
+        print("FTMS Request Control write completed: \(yesNo(r3ProbeState.controlPointWriteCompleted))")
+        print("FTMS Control Point responses: \(r3ProbeState.controlPointResponses.count)")
+        if let error = r3ProbeState.controlPointWriteError {
+            print("FTMS Control Point write error: \(error)")
+        }
+        if r3ProbeState.controlPointRequestSent, r3ProbeState.controlPointResponses.isEmpty {
+            print("FTMS Control Point result: timeout or no indication observed")
+        }
+        print("Training Status packets: \(r3ProbeState.trainingStatusPackets)")
+        print("Machine Status packets: \(r3ProbeState.machineStatusPackets)")
+        print("Supplement/vendor services present: \(yesNo(!r3ProbeState.vendorServices.isEmpty))")
+        if !r3ProbeState.vendorServices.isEmpty {
+            print("Supplement/vendor services: \(Array(r3ProbeState.vendorServices).sorted().joined(separator: ", "))")
+        }
+        print("Supplement/vendor notifications observed: \(r3ProbeState.supplementNotifications.count)")
+        print("")
+        print("Services and characteristics:")
+        for service in r3ProbeState.discoveredServices.sorted() {
+            print("- \(service)")
+            for characteristic in r3ProbeState.discoveredCharacteristics[service] ?? [] {
+                print("  - \(characteristic)")
+            }
+        }
+        print("")
+        print("Conclusion: \(summary["conclusion"] ?? "unknown")")
+        print("==========================================")
+        print("")
+    }
+
+    private func r3ProbeSummary() -> [String: Any] {
+        let ftmsPresent = r3ProbeState.discoveredServices.contains("1826")
+        let dataWorks = r3ProbeState.treadmillDataPackets > 0
+        let controlResponded = !r3ProbeState.controlPointResponses.isEmpty
+        let supplementPresent = !r3ProbeState.vendorServices.isEmpty
+        let supplementNotified = !r3ProbeState.supplementNotifications.isEmpty
+        let conclusion: String
+        if dataWorks, r3ProbeState.controlPointRequestSent, !controlResponded {
+            conclusion = supplementPresent
+                ? "FTMS data works, but standard FTMS control did not respond. Investigate supplement/vendor control path or use read-only fallback."
+                : "FTMS data works, but standard FTMS control did not respond. Treat this device as read-only unless another control path is found."
+        } else if dataWorks, controlResponded {
+            conclusion = "FTMS data and standard FTMS control response both work. WalkingMate should inspect the response code and command sequencing."
+        } else if ftmsPresent {
+            conclusion = "FTMS service is present, but no treadmill data packets were observed during the probe."
+        } else {
+            conclusion = "FTMS service was not discovered on this device."
+        }
+
+        return [
+            "ftmsPresent": ftmsPresent,
+            "treadmillDataPackets": r3ProbeState.treadmillDataPackets,
+            "dataWorks": dataWorks,
+            "controlPointRequestSent": r3ProbeState.controlPointRequestSent,
+            "controlPointWriteCompleted": r3ProbeState.controlPointWriteCompleted,
+            "controlPointWriteError": r3ProbeState.controlPointWriteError ?? NSNull(),
+            "controlPointResponses": r3ProbeState.controlPointResponses,
+            "trainingStatusPackets": r3ProbeState.trainingStatusPackets,
+            "machineStatusPackets": r3ProbeState.machineStatusPackets,
+            "supplementServices": Array(r3ProbeState.vendorServices).sorted(),
+            "supplementNotifications": r3ProbeState.supplementNotifications,
+            "supplementPresent": supplementPresent,
+            "supplementNotified": supplementNotified,
+            "readValues": r3ProbeState.readValues,
+            "treadmillSamples": r3ProbeState.treadmillSamples,
+            "conclusion": conclusion,
+        ]
+    }
+
+    private func yesNo(_ value: Bool) -> String {
+        value ? "yes" : "no"
     }
 
     private func setupSignalHandlers() {
@@ -741,7 +965,12 @@ final class BLECapture: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
     private func isLikelyTreadmill(name: String, services: [CBUUID], serviceData: [CBUUID: Data]) -> Bool {
         let lowerName = name.lowercased()
         let ftms = CBUUID(string: "1826")
-        return services.contains(ftms) || serviceData[ftms] != nil || lowerName.contains("tread") || lowerName.contains("walk") || lowerName.contains("vital")
+        return services.contains(ftms) || serviceData[ftms] != nil || lowerName.contains("tread") || lowerName.contains("walk") || lowerName.contains("vital") || lowerName.hasPrefix("ks-")
+    }
+
+    private func isKnownR3SupplementService(_ uuid: CBUUID?) -> Bool {
+        guard let uuid else { return false }
+        return uuid == CBUUID(string: "24E2521C-F63B-48ED-85BE-C5330A00FDF7") || uuid == CBUUID(string: "5833FF01-9B8B-5191-6142-22A4536EF123") || uuid == CBUUID(string: "FE00")
     }
 
     private func parseFTMSIfKnown(characteristic: CBCharacteristic, data: Data) -> [String: Any] {
