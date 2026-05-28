@@ -28,19 +28,19 @@ struct Arguments {
     static func parse(_ args: ArraySlice<String>) -> Arguments {
         var result = Arguments()
         var iterator = args.makeIterator()
+        var requestedR3Probe = false
+        var requestedInteractiveProbe = false
 
         while let arg = iterator.next() {
             switch arg {
             case "r3-probe":
-                result.mode = .r3Probe(duration: result.r3ProbeDuration, controlTests: result.r3ControlTests)
+                requestedR3Probe = true
             case "--duration":
                 if let value = iterator.next(), let seconds = TimeInterval(value) {
                     result.r3ProbeDuration = seconds
-                    result.mode = .r3Probe(duration: seconds, controlTests: result.r3ControlTests)
                 }
             case "--control-tests":
                 result.r3ControlTests = true
-                result.mode = .r3Probe(duration: result.r3ProbeDuration, controlTests: true)
             case "--i-understand-this-may-move-the-belt":
                 result.r3ControlTestsConfirmed = true
             case "--output", "-o":
@@ -50,7 +50,7 @@ struct Arguments {
                     result.scanSeconds = seconds
                 }
             case "--probe":
-                result.mode = .interactiveProbe
+                requestedInteractiveProbe = true
             case "--help", "-h":
                 print("""
                 TreadmillTrace captures raw BLE treadmill data on macOS.
@@ -78,9 +78,23 @@ struct Arguments {
             }
         }
 
-        if result.r3ControlTests, !result.r3ControlTestsConfirmed {
+        if requestedR3Probe, requestedInteractiveProbe {
+            fputs("r3-probe cannot be combined with --probe\n", stderr)
+            exit(2)
+        }
+        if !requestedR3Probe, result.r3ControlTests {
+            fputs("--control-tests requires r3-probe\n", stderr)
+            exit(2)
+        }
+        if requestedR3Probe, result.r3ControlTests, !result.r3ControlTestsConfirmed {
             fputs("--control-tests requires --i-understand-this-may-move-the-belt\n", stderr)
             exit(2)
+        }
+
+        if requestedR3Probe {
+            result.mode = .r3Probe(duration: result.r3ProbeDuration, controlTests: result.r3ControlTests)
+        } else if requestedInteractiveProbe {
+            result.mode = .interactiveProbe
         }
 
         return result
@@ -115,6 +129,7 @@ final class BLECapture: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
     private var feature: FTMSFeature?
     private var controlPointCharacteristic: CBCharacteristic?
     private var probeArmed = false
+    private var controlAcquired = false
     private var pendingCommand: PendingCommand?
     private var commandTimeoutTimer: Timer?
     private var probeRedrawTimer: Timer?
@@ -191,6 +206,8 @@ final class BLECapture: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
         var machineStatusPackets = 0
         var trainingStatusPackets = 0
         var controlPointResponses: [[String: Any]] = []
+        var requestControlResponses: [[String: Any]] = []
+        var controlPointWriteResults: [[String: String]] = []
         var controlPointWriteError: String?
         var controlPointWriteCompleted = false
         var controlPointRequestSent = false
@@ -432,13 +449,18 @@ final class BLECapture: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
             "pendingCommand": pendingCommand?.name ?? "none",
         ])
         if characteristic.uuid == CBUUID(string: "2AD9") {
-            r3ProbeState.controlPointWriteCompleted = error == nil
-            r3ProbeState.controlPointWriteError = error?.localizedDescription
-            logger.write("r3_probe.control_point_write", [
+            let result = [
                 "service": characteristic.service?.uuid.uuidString ?? "unknown",
                 "characteristic": characteristic.uuid.uuidString,
                 "error": error?.localizedDescription ?? "none",
-            ])
+                "pendingCommand": pendingCommand?.name ?? "none",
+            ]
+            r3ProbeState.controlPointWriteResults.append(result)
+            if r3ProbeState.controlPointWriteResults.count == 1 {
+                r3ProbeState.controlPointWriteCompleted = error == nil
+                r3ProbeState.controlPointWriteError = error?.localizedDescription
+            }
+            logger.write("r3_probe.control_point_write", result)
         } else if isKnownR3SupplementService(characteristic.service?.uuid) {
             let result = [
                 "service": characteristic.service?.uuid.uuidString ?? "unknown",
@@ -518,7 +540,11 @@ final class BLECapture: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
         case CBUUID(string: "2ADA"):
             r3ProbeState.machineStatusPackets += 1
         case CBUUID(string: "2AD9"):
-            r3ProbeState.controlPointResponses.append(decoded.merging(["hex": data.hexString]) { current, _ in current })
+            let response = decoded.merging(["hex": data.hexString]) { current, _ in current }
+            r3ProbeState.controlPointResponses.append(response)
+            if decoded["requestOpcodeRaw"] as? UInt8 == 0x00 {
+                r3ProbeState.requestControlResponses.append(response)
+            }
         default:
             if isKnownR3SupplementService(characteristic.service?.uuid), !wasReadRequest {
                 r3ProbeState.supplementNotifications.append([
@@ -811,13 +837,31 @@ final class BLECapture: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
     }
 
     private func sendSupplementCommand(_ name: String, _ data: Data, characteristic: CBCharacteristic) {
-        let writeType: CBCharacteristicWriteType = characteristic.properties.contains(.write) ? .withResponse : .withoutResponse
+        let writeType: CBCharacteristicWriteType
+        let writeTypeName: String
+        if characteristic.properties.contains(.write) {
+            writeType = .withResponse
+            writeTypeName = "withResponse"
+        } else if characteristic.properties.contains(.writeWithoutResponse) {
+            writeType = .withoutResponse
+            writeTypeName = "withoutResponse"
+        } else {
+            logger.write("r3_probe.supplement_tx_skipped", [
+                "name": name,
+                "service": characteristic.service?.uuid.uuidString ?? "unknown",
+                "characteristic": characteristic.uuid.uuidString,
+                "hex": data.hexString,
+                "reason": "write_not_supported",
+            ])
+            return
+        }
+
         let record = [
             "name": name,
             "service": characteristic.service?.uuid.uuidString ?? "unknown",
             "characteristic": characteristic.uuid.uuidString,
             "hex": data.hexString,
-            "writeType": writeType == .withResponse ? "withResponse" : "withoutResponse",
+            "writeType": writeTypeName,
         ]
         print("Sending safe supplement probe \(name): \(data.hexString)")
         r3ProbeState.supplementCommandsSent.append(record)
@@ -997,7 +1041,7 @@ final class BLECapture: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
     private func r3ProbeSummary() -> [String: Any] {
         let ftmsPresent = r3ProbeState.discoveredServices.contains("1826")
         let dataWorks = r3ProbeState.treadmillDataPackets > 0
-        let controlResponded = !r3ProbeState.controlPointResponses.isEmpty
+        let controlResponded = !r3ProbeState.requestControlResponses.isEmpty
         let supplementPresent = !r3ProbeState.vendorServices.isEmpty
         let supplementNotified = !r3ProbeState.supplementNotifications.isEmpty
         let supplementCommandsSent = !r3ProbeState.supplementCommandsSent.isEmpty
@@ -1029,6 +1073,8 @@ final class BLECapture: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
             "controlPointWriteCompleted": r3ProbeState.controlPointWriteCompleted,
             "controlPointWriteError": r3ProbeState.controlPointWriteError ?? NSNull(),
             "controlPointResponses": r3ProbeState.controlPointResponses,
+            "requestControlResponses": r3ProbeState.requestControlResponses,
+            "controlPointWriteResults": r3ProbeState.controlPointWriteResults,
             "trainingStatusPackets": r3ProbeState.trainingStatusPackets,
             "machineStatusPackets": r3ProbeState.machineStatusPackets,
             "supplementServices": Array(r3ProbeState.vendorServices).sorted(),
@@ -1115,8 +1161,11 @@ final class BLECapture: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
 
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             guard let self else { return }
-            self.collectDisplayUnit()
-            let steps = self.buildCaptureSteps()
+            let unit = self.collectDisplayUnit()
+            let steps = DispatchQueue.main.sync {
+                self.displayUnit = unit
+                return self.buildCaptureSteps()
+            }
 
             for step in steps {
                 self.run(step: step)
@@ -1131,17 +1180,19 @@ final class BLECapture: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
         }
     }
 
-    private func collectDisplayUnit() {
+    private func collectDisplayUnit() -> String {
         print("Which unit does the treadmill display use? Type kmh, mph, or press return if unknown:")
         let input = readLine()?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? ""
+        let unit: String
         if ["kmh", "km/h", "kph"].contains(input) {
-            displayUnit = "kmh"
+            unit = "kmh"
         } else if input == "mph" {
-            displayUnit = "mph"
+            unit = "mph"
         } else {
-            displayUnit = "unknown"
+            unit = "unknown"
         }
-        logger.write("user.context", ["displayUnit": displayUnit])
+        logger.write("user.context", ["displayUnit": unit])
+        return unit
     }
 
     private func buildCaptureSteps() -> [CaptureStep] {
@@ -1469,11 +1520,15 @@ final class BLECapture: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
         case 0x1B:
             var input = pollfd(fd: STDIN_FILENO, events: Int16(POLLIN), revents: 0)
             guard poll(&input, 1, 100) > 0 else { return .unknown("escape") }
-            var sequence = [UInt8](repeating: 0, count: 2)
-            guard read(STDIN_FILENO, &sequence, 2) == 2, sequence[0] == 0x5B else {
+            var prefix: UInt8 = 0
+            guard read(STDIN_FILENO, &prefix, 1) == 1, prefix == 0x5B else {
                 return .unknown("escape")
             }
-            switch sequence[1] {
+            var code: UInt8 = 0
+            guard read(STDIN_FILENO, &code, 1) == 1 else {
+                return .unknown("escape")
+            }
+            switch code {
             case 0x41: return .speedUp
             case 0x42: return .speedDown
             case 0x43: return .inclineUp
@@ -1536,6 +1591,7 @@ final class BLECapture: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
         printLine("Steps:      \(latestStatus.fitshowSteps.map(String.init) ?? latestStatus.ftmsVendorField.map(String.init) ?? "unknown")")
         printLine("Status:     \(latestStatus.machineStatusOpcode ?? "unknown")")
         printLine("Armed:      \(probeArmed ? "yes" : "no")")
+        printLine("Control:    \(controlAcquired ? "acquired" : "not acquired")")
         printLine("Pending:    \(pendingCommand?.name ?? "none")")
         printLine("")
         printLine("Controls:")
@@ -1583,7 +1639,7 @@ final class BLECapture: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
             probeMessage = "Speed range is unknown. Refusing to send speed command."
             return
         }
-        let baseline = lastCommandedSpeedKmh ?? speedRange.minimumKmh
+        let baseline = lastCommandedSpeedKmh ?? latestStatus.speedKmh ?? speedRange.minimumKmh
         guard let command = FTMSCommand.speed(requestedKmh: baseline + direction * speedRange.incrementKmh, range: speedRange) else {
             rejectProbeCommand("speed_delta", reason: "invalid_speed")
             probeMessage = "Invalid speed target."
@@ -1609,11 +1665,7 @@ final class BLECapture: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
 
     private func quitProbe() {
         logger.write("probe.end", ["reason": "user_quit"])
-        if let selected {
-            central.cancelPeripheralConnection(selected)
-        } else {
-            finish(0)
-        }
+        finish(0)
     }
 
     private func sendProbeCommand(_ command: FTMSCommand) {
@@ -1625,6 +1677,11 @@ final class BLECapture: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
         guard pendingCommand == nil else {
             rejectProbeCommand(command.name, reason: "command_pending")
             probeMessage = "A command is still pending. Wait for response or timeout."
+            return
+        }
+        if command.name != "request", command.name != "stop", !controlAcquired {
+            rejectProbeCommand(command.name, reason: "control_not_acquired")
+            probeMessage = "Request control first and wait for a successful response."
             return
         }
         guard let selected, let controlPointCharacteristic else {
@@ -1704,7 +1761,9 @@ final class BLECapture: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
             commandTimeoutTimer = nil
             pendingCommand = nil
             if decoded["resultCode"] as? String == "0x01" {
-                if pending.name == "speed" {
+                if pending.name == "request" {
+                    controlAcquired = true
+                } else if pending.name == "speed" {
                     lastCommandedSpeedKmh = pending.target
                 } else if pending.name == "incline" {
                     lastCommandedInclinePercent = pending.target

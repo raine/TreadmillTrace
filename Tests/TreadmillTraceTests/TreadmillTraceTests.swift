@@ -78,6 +78,16 @@ import Testing
 @Test func parsesProbeArgument() {
     #expect(Arguments.parse(["--probe"]).probeMode == true)
     #expect(Arguments.parse([]).probeMode == false)
+    #expect(Arguments.parse(["--duration", "45"]).probeMode == false)
+
+    let r3 = Arguments.parse(["r3-probe", "--duration", "45"])
+    #expect(r3.probeMode == false)
+    if case let .r3Probe(duration, controlTests) = r3.mode {
+        #expect(duration == 45)
+        #expect(controlTests == false)
+    } else {
+        Issue.record("expected r3 probe mode")
+    }
 }
 
 private extension Data {
