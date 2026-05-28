@@ -1,6 +1,6 @@
 # TreadmillTrace
 
-Standalone macOS BLE capture tool for FTMS treadmills and walking pads.
+Helper tool for [WalkingMate](https://walkingmate.zendit.fi) that captures macOS BLE diagnostics from FTMS treadmills and walking pads.
 
 ## Build
 
