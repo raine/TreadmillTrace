@@ -171,8 +171,11 @@ final class BLECapture: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
         var controlPointWriteError: String?
         var controlPointWriteCompleted = false
         var controlPointRequestSent = false
+        var supplementCommandsSent: [[String: String]] = []
+        var supplementWriteResults: [[String: String]] = []
         var supplementNotifications: [[String: String]] = []
         var vendorServices: Set<String> = []
+        var parsedReadValues: [String: [String: Any]] = [:]
     }
 
     init(logger: TraceLogger, scanSeconds: TimeInterval, mode: CaptureMode) {
@@ -428,14 +431,23 @@ final class BLECapture: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
     }
 
     func peripheral(_: CBPeripheral, didWriteValueFor characteristic: CBCharacteristic, error: Error?) {
-        guard characteristic.uuid == CBUUID(string: "2AD9") else { return }
-        r3ProbeState.controlPointWriteCompleted = error == nil
-        r3ProbeState.controlPointWriteError = error?.localizedDescription
-        logger.write("r3_probe.control_point_write", [
-            "service": characteristic.service?.uuid.uuidString ?? "unknown",
-            "characteristic": characteristic.uuid.uuidString,
-            "error": error?.localizedDescription ?? "none",
-        ])
+        if characteristic.uuid == CBUUID(string: "2AD9") {
+            r3ProbeState.controlPointWriteCompleted = error == nil
+            r3ProbeState.controlPointWriteError = error?.localizedDescription
+            logger.write("r3_probe.control_point_write", [
+                "service": characteristic.service?.uuid.uuidString ?? "unknown",
+                "characteristic": characteristic.uuid.uuidString,
+                "error": error?.localizedDescription ?? "none",
+            ])
+        } else if isKnownR3SupplementService(characteristic.service?.uuid) {
+            let result = [
+                "service": characteristic.service?.uuid.uuidString ?? "unknown",
+                "characteristic": characteristic.uuid.uuidString,
+                "error": error?.localizedDescription ?? "none",
+            ]
+            r3ProbeState.supplementWriteResults.append(result)
+            logger.write("r3_probe.supplement_write", result)
+        }
     }
 
     private func characteristicKey(_ characteristic: CBCharacteristic) -> String {
@@ -446,6 +458,11 @@ final class BLECapture: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
         let key = characteristicKey(characteristic)
         if wasReadRequest {
             r3ProbeState.readValues[key] = data.hexString
+            if !ftms.isEmpty {
+                r3ProbeState.parsedReadValues[key] = ftms
+            } else if let text = String(data: data, encoding: .utf8), !text.isEmpty {
+                r3ProbeState.parsedReadValues[key] = ["utf8": text]
+            }
         }
 
         switch characteristic.uuid {
@@ -659,6 +676,8 @@ final class BLECapture: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
             logger.write("r3_probe.control_point_missing", [:])
         }
 
+        sendSafeSupplementProbeCommands()
+
         if controlTests {
             DispatchQueue.global(qos: .userInitiated).async { [weak self] in
                 self?.runR3ControlTests()
@@ -685,6 +704,61 @@ final class BLECapture: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
         peripheral.services?
             .flatMap { $0.characteristics ?? [] }
             .first { $0.uuid == uuid }
+    }
+
+    private func sendSafeSupplementProbeCommands() {
+        guard let selected else { return }
+        let commands: [(name: String, service: String, characteristic: String, hex: [UInt8])] = [
+            (
+                "supplement_init_0",
+                "24E2521C-F63B-48ED-85BE-C5330A00FDF7",
+                "24E2521C-F63B-48ED-85BE-C5330D00FDF7",
+                [0x71, 0x00, 0x05, 0xFE, 0x2B, 0x5B, 0x31, 0x44, 0x6F]
+            ),
+            (
+                "supplement_init_1",
+                "24E2521C-F63B-48ED-85BE-C5330A00FDF7",
+                "24E2521C-F63B-48ED-85BE-C5330D00FDF7",
+                [0x71, 0x01, 0x08, 0x79, 0xE5, 0x92, 0x69, 0xAF, 0x30, 0x59, 0x00, 0x0B]
+            ),
+            (
+                "supplement_query_all_properties",
+                "24E2521C-F63B-48ED-85BE-C5330A00FDF7",
+                "24E2521C-F63B-48ED-85BE-C5330D00FDF7",
+                [0x72, 0x00, 0x00, 0x00, 0x72]
+            ),
+        ]
+
+        for command in commands {
+            guard let characteristic = findCharacteristic(
+                serviceUUID: CBUUID(string: command.service),
+                characteristicUUID: CBUUID(string: command.characteristic),
+                in: selected
+            ) else { continue }
+            sendSupplementCommand(command.name, Data(command.hex), characteristic: characteristic)
+        }
+    }
+
+    private func sendSupplementCommand(_ name: String, _ data: Data, characteristic: CBCharacteristic) {
+        let writeType: CBCharacteristicWriteType = characteristic.properties.contains(.write) ? .withResponse : .withoutResponse
+        let record = [
+            "name": name,
+            "service": characteristic.service?.uuid.uuidString ?? "unknown",
+            "characteristic": characteristic.uuid.uuidString,
+            "hex": data.hexString,
+            "writeType": writeType == .withResponse ? "withResponse" : "withoutResponse",
+        ]
+        print("Sending safe supplement probe \(name): \(data.hexString)")
+        r3ProbeState.supplementCommandsSent.append(record)
+        logger.write("r3_probe.supplement_tx", record)
+        selected?.writeValue(data, for: characteristic, type: writeType)
+    }
+
+    private func findCharacteristic(serviceUUID: CBUUID, characteristicUUID: CBUUID, in peripheral: CBPeripheral) -> CBCharacteristic? {
+        peripheral.services?
+            .first { $0.uuid == serviceUUID }?
+            .characteristics?
+            .first { $0.uuid == characteristicUUID }
     }
 
     private struct R3ControlCommand {
@@ -803,8 +877,39 @@ final class BLECapture: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
         if !r3ProbeState.vendorServices.isEmpty {
             print("Supplement/vendor services: \(Array(r3ProbeState.vendorServices).sorted().joined(separator: ", "))")
         }
+        print("Supplement/vendor safe commands sent: \(r3ProbeState.supplementCommandsSent.count)")
+        print("Supplement/vendor write responses: \(r3ProbeState.supplementWriteResults.count)")
         print("Supplement/vendor notifications observed: \(r3ProbeState.supplementNotifications.count)")
         print("")
+        print("Read values:")
+        for key in r3ProbeState.readValues.keys.sorted() {
+            print("- \(key): \(r3ProbeState.readValues[key] ?? "")")
+            if let parsed = r3ProbeState.parsedReadValues[key], !parsed.isEmpty {
+                print("  decoded: \(formatJSONObject(parsed))")
+            }
+        }
+        print("")
+        if !r3ProbeState.treadmillSamples.isEmpty {
+            print("Treadmill data samples:")
+            for sample in r3ProbeState.treadmillSamples {
+                print("- \(formatJSONObject(sample))")
+            }
+            print("")
+        }
+        if !r3ProbeState.controlPointResponses.isEmpty {
+            print("FTMS Control Point responses:")
+            for response in r3ProbeState.controlPointResponses {
+                print("- \(formatJSONObject(response))")
+            }
+            print("")
+        }
+        if !r3ProbeState.supplementNotifications.isEmpty {
+            print("Supplement/vendor notifications:")
+            for notification in r3ProbeState.supplementNotifications.prefix(10) {
+                print("- \(formatJSONObject(notification))")
+            }
+            print("")
+        }
         print("Services and characteristics:")
         for service in r3ProbeState.discoveredServices.sorted() {
             print("- \(service)")
@@ -824,11 +929,19 @@ final class BLECapture: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
         let controlResponded = !r3ProbeState.controlPointResponses.isEmpty
         let supplementPresent = !r3ProbeState.vendorServices.isEmpty
         let supplementNotified = !r3ProbeState.supplementNotifications.isEmpty
+        let supplementCommandsSent = !r3ProbeState.supplementCommandsSent.isEmpty
+        let supplementWritesCompleted = r3ProbeState.supplementWriteResults.contains { $0["error"] == "none" }
         let conclusion: String
         if dataWorks, r3ProbeState.controlPointRequestSent, !controlResponded {
-            conclusion = supplementPresent
-                ? "FTMS data works, but standard FTMS control did not respond. Investigate supplement/vendor control path or use read-only fallback."
-                : "FTMS data works, but standard FTMS control did not respond. Treat this device as read-only unless another control path is found."
+            if supplementNotified {
+                conclusion = "FTMS data works, standard FTMS control did not respond, and supplement notifications were observed. Prioritize the KingSmith supplement control path."
+            } else if supplementCommandsSent, supplementWritesCompleted {
+                conclusion = "FTMS data works and safe supplement commands were accepted, but no supplement notification was observed. Inspect the log for write type or command sequencing differences."
+            } else {
+                conclusion = supplementPresent
+                    ? "FTMS data works, but standard FTMS control did not respond. Investigate supplement/vendor control path or use read-only fallback."
+                    : "FTMS data works, but standard FTMS control did not respond. Treat this device as read-only unless another control path is found."
+            }
         } else if dataWorks, controlResponded {
             conclusion = "FTMS data and standard FTMS control response both work. WalkingMate should inspect the response code and command sequencing."
         } else if ftmsPresent {
@@ -848,10 +961,15 @@ final class BLECapture: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
             "trainingStatusPackets": r3ProbeState.trainingStatusPackets,
             "machineStatusPackets": r3ProbeState.machineStatusPackets,
             "supplementServices": Array(r3ProbeState.vendorServices).sorted(),
+            "supplementCommandsSent": r3ProbeState.supplementCommandsSent,
+            "supplementWriteResults": r3ProbeState.supplementWriteResults,
             "supplementNotifications": r3ProbeState.supplementNotifications,
             "supplementPresent": supplementPresent,
+            "supplementCommandsSentAny": supplementCommandsSent,
+            "supplementWritesCompleted": supplementWritesCompleted,
             "supplementNotified": supplementNotified,
             "readValues": r3ProbeState.readValues,
+            "parsedReadValues": r3ProbeState.parsedReadValues,
             "treadmillSamples": r3ProbeState.treadmillSamples,
             "conclusion": conclusion,
         ]
@@ -859,6 +977,16 @@ final class BLECapture: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
 
     private func yesNo(_ value: Bool) -> String {
         value ? "yes" : "no"
+    }
+
+    private func formatJSONObject(_ value: Any) -> String {
+        guard JSONSerialization.isValidJSONObject(value),
+              let data = try? JSONSerialization.data(withJSONObject: value, options: [.sortedKeys]),
+              let string = String(data: data, encoding: .utf8)
+        else {
+            return String(describing: value)
+        }
+        return string
     }
 
     private func setupSignalHandlers() {
@@ -1134,7 +1262,57 @@ final class BLECapture: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
         return [
             "fitnessMachineFeatures": String(format: "0x%08X", fitnessMachineFeatures),
             "targetSettingFeatures": String(format: "0x%08X", targetSettingFeatures),
+            "fitnessMachineFeatureNames": decodedFeatureNames(
+                fitnessMachineFeatures,
+                names: [
+                    0: "averageSpeed",
+                    1: "cadence",
+                    2: "totalDistance",
+                    3: "inclination",
+                    4: "elevationGain",
+                    5: "pace",
+                    6: "stepCount",
+                    7: "resistanceLevel",
+                    8: "strideCount",
+                    9: "expendedEnergy",
+                    10: "heartRateMeasurement",
+                    11: "metabolicEquivalent",
+                    12: "elapsedTime",
+                    13: "remainingTime",
+                    14: "powerMeasurement",
+                    15: "forceOnBeltAndPowerOutput",
+                    16: "userDataRetention",
+                ]
+            ),
+            "targetSettingFeatureNames": decodedFeatureNames(
+                targetSettingFeatures,
+                names: [
+                    0: "speedTargetSetting",
+                    1: "inclinationTargetSetting",
+                    2: "resistanceTargetSetting",
+                    3: "powerTargetSetting",
+                    4: "heartRateTargetSetting",
+                    5: "targetedExpendedEnergyConfiguration",
+                    6: "targetedStepNumberConfiguration",
+                    7: "targetedStrideNumberConfiguration",
+                    8: "targetedDistanceConfiguration",
+                    9: "targetedTrainingTimeConfiguration",
+                    10: "targetedTimeInTwoHeartRateZonesConfiguration",
+                    11: "targetedTimeInThreeHeartRateZonesConfiguration",
+                    12: "targetedTimeInFiveHeartRateZonesConfiguration",
+                    13: "indoorBikeSimulationParameters",
+                    14: "wheelCircumferenceConfiguration",
+                    15: "spinDownControl",
+                    16: "targetedCadenceConfiguration",
+                ]
+            ),
         ]
+    }
+
+    private func decodedFeatureNames(_ flags: UInt32, names: [Int: String]) -> [String] {
+        names.keys.sorted().compactMap { bit in
+            flags & (1 << UInt32(bit)) == 0 ? nil : names[bit]
+        }
     }
 
     private func parseSupportedSpeedRange(_ data: Data) -> [String: Any] {
