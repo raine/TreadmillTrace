@@ -873,7 +873,7 @@ final class BLECapture: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
             print("Could not enable terminal control mode.")
             finish(1)
         }
-        print("\u{001B}[?25l", terminator: "")
+        print("\u{001B}[2J\u{001B}[?25l", terminator: "")
         redrawProbeScreen()
         probeRedrawTimer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
             self?.redrawProbeScreen()
@@ -991,26 +991,30 @@ final class BLECapture: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
 
     private func redrawProbeScreen() {
         print("\u{001B}[H", terminator: "")
-        print("TreadmillTrace probe")
-        print("Log: \(logger.path)")
-        print("Stand off the belt and keep the stop control reachable before arming.")
-        print("")
-        print("Speed:      \(latestStatus.speedKmh.map { "\(format($0)) km/h" } ?? "unknown")")
-        print("Commanded:  \(lastCommandedSpeedKmh.map { "\(format($0)) km/h" } ?? "unknown")")
-        print("Distance:   \(latestStatus.distanceMeters.map { "\($0) m" } ?? "unknown")")
-        print("Time:       \(latestStatus.elapsedSeconds.map(formatElapsed) ?? "unknown")")
-        print("Incline:    \(latestStatus.inclinePercent.map { "\(format($0))%" } ?? "unknown")")
-        print("Steps:      \(latestStatus.fitshowSteps.map(String.init) ?? latestStatus.ftmsVendorField.map(String.init) ?? "unknown")")
-        print("Status:     \(latestStatus.machineStatusOpcode ?? "unknown")")
-        print("Armed:      \(probeArmed ? "yes" : "no")")
-        print("Pending:    \(pendingCommand?.name ?? "none")")
-        print("")
-        print("Controls:")
-        print("  a arm     r request control     space start     s stop     q quit")
-        print("  up/down speed +/- range increment     left/right incline -/+ range increment")
-        print("")
-        print("Message: \(probeMessage)")
+        printLine("TreadmillTrace probe")
+        printLine("Log: \(logger.path)")
+        printLine("Stand off the belt and keep the stop control reachable before arming.")
+        printLine("")
+        printLine("Speed:      \(latestStatus.speedKmh.map { "\(format($0)) km/h" } ?? "unknown")")
+        printLine("Commanded:  \(lastCommandedSpeedKmh.map { "\(format($0)) km/h" } ?? "unknown")")
+        printLine("Distance:   \(latestStatus.distanceMeters.map { "\($0) m" } ?? "unknown")")
+        printLine("Time:       \(latestStatus.elapsedSeconds.map(formatElapsed) ?? "unknown")")
+        printLine("Incline:    \(latestStatus.inclinePercent.map { "\(format($0))%" } ?? "unknown")")
+        printLine("Steps:      \(latestStatus.fitshowSteps.map(String.init) ?? latestStatus.ftmsVendorField.map(String.init) ?? "unknown")")
+        printLine("Status:     \(latestStatus.machineStatusOpcode ?? "unknown")")
+        printLine("Armed:      \(probeArmed ? "yes" : "no")")
+        printLine("Pending:    \(pendingCommand?.name ?? "none")")
+        printLine("")
+        printLine("Controls:")
+        printLine("  a arm     r request control     space start     s stop     q quit")
+        printLine("  up/down speed +/- range increment     left/right incline -/+ range increment")
+        printLine("")
+        printLine("Message: \(probeMessage)")
         fflush(stdout)
+    }
+
+    private func printLine(_ line: String) {
+        print("\(line)\u{001B}[K")
     }
 
     private func formatElapsed(_ seconds: UInt16) -> String {
