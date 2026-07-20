@@ -30,11 +30,14 @@ struct Arguments {
         var iterator = args.makeIterator()
         var requestedR3Probe = false
         var requestedInteractiveProbe = false
+        var requestedTimeProbe = false
 
         while let arg = iterator.next() {
             switch arg {
             case "r3-probe":
                 requestedR3Probe = true
+            case "time-probe":
+                requestedTimeProbe = true
             case "--duration":
                 if let value = iterator.next(), let seconds = TimeInterval(value) {
                     result.r3ProbeDuration = seconds
@@ -57,6 +60,7 @@ struct Arguments {
 
                 Usage:
                   treadmill-trace [--output path] [--scan-seconds 12] [--probe]
+                  treadmill-trace time-probe [--output path] [--scan-seconds 12]
                   treadmill-trace r3-probe [--duration 30] [--output path] [--scan-seconds 12]
                   treadmill-trace r3-probe --control-tests --i-understand-this-may-move-the-belt
 
@@ -66,6 +70,10 @@ struct Arguments {
 
                 --probe starts a live FTMS control probe after setup. It shows
                 real-time stats and requires pressing a before control writes.
+
+                time-probe guides a passive comparison of normal and countdown
+                workouts. It records raw FTMS flags, bytes, elapsed time, and
+                remaining time without sending treadmill control commands.
 
                 r3-probe runs a WalkingPad R3 diagnostic. Safe mode sends FTMS
                 Request Control and known KingSmith supplement init/query commands,
@@ -78,8 +86,9 @@ struct Arguments {
             }
         }
 
-        if requestedR3Probe, requestedInteractiveProbe {
-            fputs("r3-probe cannot be combined with --probe\n", stderr)
+        let requestedModes = [requestedR3Probe, requestedInteractiveProbe, requestedTimeProbe].filter { $0 }.count
+        if requestedModes > 1 {
+            fputs("r3-probe, time-probe, and --probe cannot be combined\n", stderr)
             exit(2)
         }
         if !requestedR3Probe, result.r3ControlTests {
@@ -95,6 +104,8 @@ struct Arguments {
             result.mode = .r3Probe(duration: result.r3ProbeDuration, controlTests: result.r3ControlTests)
         } else if requestedInteractiveProbe {
             result.mode = .interactiveProbe
+        } else if requestedTimeProbe {
+            result.mode = .timeProbe
         }
 
         return result
@@ -104,6 +115,7 @@ struct Arguments {
 enum CaptureMode {
     case guidedCapture
     case interactiveProbe
+    case timeProbe
     case r3Probe(duration: TimeInterval, controlTests: Bool)
 }
 
@@ -186,6 +198,9 @@ final class BLECapture: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
         var lastDistanceMeters: Int?
         var firstElapsedTimeSeconds: UInt16?
         var lastElapsedTimeSeconds: UInt16?
+        var firstRemainingTimeSeconds: UInt16?
+        var lastRemainingTimeSeconds: UInt16?
+        var treadmillDataFlags: Set<String> = []
         var machineStatusOpcodes: Set<String> = []
     }
 
@@ -247,6 +262,7 @@ final class BLECapture: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
         switch mode {
         case .guidedCapture: "guidedCapture"
         case .interactiveProbe: "interactiveProbe"
+        case .timeProbe: "timeProbe"
         case let .r3Probe(_, controlTests): controlTests ? "r3ProbeControlTests" : "r3Probe"
         }
     }
@@ -604,6 +620,7 @@ final class BLECapture: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
         let speedKmh = ftms["speedKmh"] as? Double
         let distanceMeters = ftms["totalDistanceMeters"] as? Int
         let elapsedTimeSeconds = ftms["elapsedTimeSeconds"] as? UInt16
+        let remainingTimeSeconds = ftms["remainingTimeSeconds"] as? UInt16
         let inclinePercent = ftms["inclinationPercent"] as? Double
         let vendorField = ftms["vendorFieldRaw16"] as? UInt16
 
@@ -649,6 +666,13 @@ final class BLECapture: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
         if let elapsedTimeSeconds {
             if stats.firstElapsedTimeSeconds == nil { stats.firstElapsedTimeSeconds = elapsedTimeSeconds }
             stats.lastElapsedTimeSeconds = elapsedTimeSeconds
+        }
+        if let remainingTimeSeconds {
+            if stats.firstRemainingTimeSeconds == nil { stats.firstRemainingTimeSeconds = remainingTimeSeconds }
+            stats.lastRemainingTimeSeconds = remainingTimeSeconds
+        }
+        if let flags = ftms["flags"] as? String {
+            stats.treadmillDataFlags.insert(flags)
         }
         phaseStats[phase.id] = stats
     }
@@ -740,6 +764,8 @@ final class BLECapture: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
                 self.printCaptureInstructions()
             case .interactiveProbe:
                 self.startProbeMode()
+            case .timeProbe:
+                self.startTimeProbe()
             case let .r3Probe(duration, controlTests):
                 self.startR3Probe(duration: duration, controlTests: controlTests)
             }
@@ -1140,6 +1166,72 @@ final class BLECapture: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
         exit(code)
     }
 
+    private func startTimeProbe() {
+        discoveryTimeout?.invalidate()
+        let hasTreadmillData = notifiedCharacteristics.contains { $0.hasSuffix("/2ACD") }
+        guard hasTreadmillData else {
+            logger.write("session.end", ["reason": "missing_2ACD_notification"])
+            print("FTMS Treadmill Data notifications could not be enabled.")
+            finish(1)
+        }
+
+        print("")
+        print("Time diagnostic capture is ready.")
+        print("Use only the treadmill remote or panel. The tool sends no control commands.")
+        print("Follow each prompt and press return only after the requested state is visible.")
+        print("")
+
+        let steps = [
+            CaptureStep(
+                instruction: "Leave the treadmill idle, then press return to record 10 seconds.",
+                fields: ["phase": "idle"],
+                duration: 10
+            ),
+            CaptureStep(
+                instruction: "Start a normal workout without a duration target. When its timer is running, press return to record 20 seconds.",
+                fields: ["phase": "normal_workout", "expectedTimer": "count_up"],
+                duration: 20
+            ),
+            CaptureStep(
+                instruction: "Stop the treadmill and wait for the belt to stop, then press return to record 10 seconds.",
+                fields: ["phase": "between_workouts"],
+                duration: 10
+            ),
+            CaptureStep(
+                instruction: "Configure a duration target, start the workout, and wait for its countdown to begin. Then press return to record 20 seconds.",
+                fields: ["phase": "countdown_workout", "expectedTimer": "count_down"],
+                duration: 20
+            ),
+            CaptureStep(
+                instruction: "Stop the treadmill and wait for the belt to stop, then press return to record 10 seconds.",
+                fields: ["phase": "final_stop"],
+                duration: 10
+            ),
+        ]
+
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let self else { return }
+            for step in steps {
+                self.run(step: step)
+            }
+
+            DispatchQueue.main.async {
+                self.logCaptureQuality()
+                self.logger.write("time_probe.finished", ["phaseCount": steps.count])
+                print("")
+                print("Capture complete.")
+                print("Send this file with your report:")
+                print(self.logger.path)
+                print("")
+                if let selected = self.selected {
+                    self.central.cancelPeripheralConnection(selected)
+                } else {
+                    self.finish(0)
+                }
+            }
+        }
+    }
+
     private func printCaptureInstructions() {
         discoveryTimeout?.invalidate()
         let hasTreadmillData = notifiedCharacteristics.contains { $0.hasSuffix("/2ACD") }
@@ -1291,6 +1383,7 @@ final class BLECapture: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
 
     private func finishCurrentPhase(phaseId: String) -> [String: Any] {
         let stats = phaseStats[phaseId] ?? PhaseStats()
+        let phaseFields = currentPhase?.fields ?? [:]
         currentPhase = nil
 
         let distanceIncreased = if let first = stats.firstDistanceMeters, let last = stats.lastDistanceMeters {
@@ -1304,17 +1397,34 @@ final class BLECapture: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
             false
         }
 
-        return [
+        let summary: [String: Any] = [
             "phaseId": phaseId,
             "treadmillDataPackets": stats.treadmillDataPackets,
             "nonzeroSpeedSamples": stats.nonzeroSpeedSamples,
             "firstSpeedKmh": stats.firstSpeedKmh ?? NSNull(),
             "lastSpeedKmh": stats.lastSpeedKmh ?? NSNull(),
+            "firstDistanceMeters": stats.firstDistanceMeters ?? NSNull(),
+            "lastDistanceMeters": stats.lastDistanceMeters ?? NSNull(),
             "distanceIncreased": distanceIncreased,
+            "firstElapsedTimeSeconds": stats.firstElapsedTimeSeconds ?? NSNull(),
+            "lastElapsedTimeSeconds": stats.lastElapsedTimeSeconds ?? NSNull(),
+            "elapsedTimeTrend": timeTrend(first: stats.firstElapsedTimeSeconds, last: stats.lastElapsedTimeSeconds),
             "elapsedTimeIncreased": elapsedIncreased,
+            "firstRemainingTimeSeconds": stats.firstRemainingTimeSeconds ?? NSNull(),
+            "lastRemainingTimeSeconds": stats.lastRemainingTimeSeconds ?? NSNull(),
+            "remainingTimeTrend": timeTrend(first: stats.firstRemainingTimeSeconds, last: stats.lastRemainingTimeSeconds),
+            "treadmillDataFlags": Array(stats.treadmillDataFlags).sorted(),
             "machineStatusOpcodes": Array(stats.machineStatusOpcodes).sorted(),
             "hasEnoughSamples": stats.treadmillDataPackets >= minimumPhaseSamples,
         ]
+        return phaseFields.merging(summary) { _, summaryValue in summaryValue }
+    }
+
+    private func timeTrend(first: UInt16?, last: UInt16?) -> String {
+        guard let first, let last else { return "absent" }
+        if last > first { return "increasing" }
+        if last < first { return "decreasing" }
+        return "unchanged"
     }
 
     private func logCaptureQuality() {

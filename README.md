@@ -26,6 +26,23 @@ Optional:
 .build/release/TreadmillTrace --output ~/Desktop/vitalwalk.jsonl --scan-seconds 15
 ```
 
+## Time diagnostic
+
+Use this passive capture when a treadmill timer counts down or WalkingMate saves
+multiple workouts during one walk:
+
+```sh
+.build/release/TreadmillTrace time-probe --output ~/Desktop/treadmill-time.jsonl
+```
+
+The tool guides you through idle, a normal count-up workout, a stopped state,
+and a duration-target countdown workout. Use the treadmill remote or panel for
+all actions. TreadmillTrace sends no control commands in this mode.
+
+Each phase records raw FTMS Treadmill Data bytes and flags, plus separately
+decoded elapsed-time and remaining-time values. At the end, the tool prints the
+path of the JSONL file to send with the issue report.
+
 ## Probe mode
 
 ```sh

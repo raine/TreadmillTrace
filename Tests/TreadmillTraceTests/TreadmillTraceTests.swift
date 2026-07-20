@@ -28,6 +28,25 @@ import Testing
     #expect(decoded.vendorFieldRaw16 == 27)
 }
 
+@Test func parsesElapsedAndRemainingTimeFields() {
+    let elapsedOnly = FTMSParser.parseTreadmillData(Data(hexString: "00 04 00 00 2A 00"))
+    #expect(elapsedOnly.flags == 0x0400)
+    #expect(elapsedOnly.elapsedTimeSeconds == 42)
+    #expect(elapsedOnly.remainingTimeSeconds == nil)
+
+    let remainingOnly = FTMSParser.parseTreadmillData(Data(hexString: "00 08 00 00 78 00"))
+    #expect(remainingOnly.flags == 0x0800)
+    #expect(remainingOnly.elapsedTimeSeconds == nil)
+    #expect(remainingOnly.remainingTimeSeconds == 120)
+
+    let both = FTMSParser.parseTreadmillData(Data(hexString: "00 0C 00 00 2A 00 78 00"))
+    #expect(both.flags == 0x0C00)
+    #expect(both.elapsedTimeSeconds == 42)
+    #expect(both.remainingTimeSeconds == 120)
+    #expect(both.consumedBytes == 8)
+    #expect(both.trailingBytes == 0)
+}
+
 @Test func parsesFitshowCandidateSteps() throws {
     let data = Data(hexString: "02 51 0A 00 00 E9 00 BE 00 A9 00 C7 00 00 00 62 03")
 
@@ -79,6 +98,13 @@ import Testing
     #expect(Arguments.parse(["--probe"]).probeMode == true)
     #expect(Arguments.parse([]).probeMode == false)
     #expect(Arguments.parse(["--duration", "45"]).probeMode == false)
+
+    let timeProbe = Arguments.parse(["time-probe", "--output", "capture.jsonl"])
+    if case .timeProbe = timeProbe.mode {
+        #expect(timeProbe.outputPath == "capture.jsonl")
+    } else {
+        Issue.record("expected time probe mode")
+    }
 
     let r3 = Arguments.parse(["r3-probe", "--duration", "45"])
     #expect(r3.probeMode == false)
