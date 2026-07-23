@@ -31,6 +31,7 @@ struct Arguments {
         var requestedR3Probe = false
         var requestedInteractiveProbe = false
         var requestedTimeProbe = false
+        var requestedVitalwalkProbe = false
 
         while let arg = iterator.next() {
             switch arg {
@@ -38,6 +39,8 @@ struct Arguments {
                 requestedR3Probe = true
             case "time-probe":
                 requestedTimeProbe = true
+            case "vitalwalk-probe":
+                requestedVitalwalkProbe = true
             case "--duration":
                 if let value = iterator.next(), let seconds = TimeInterval(value) {
                     result.r3ProbeDuration = seconds
@@ -61,6 +64,7 @@ struct Arguments {
                 Usage:
                   treadmill-trace [--output path] [--scan-seconds 12] [--probe]
                   treadmill-trace time-probe [--output path] [--scan-seconds 12]
+                  treadmill-trace vitalwalk-probe [--output path] [--scan-seconds 12]
                   treadmill-trace r3-probe [--duration 30] [--output path] [--scan-seconds 12]
                   treadmill-trace r3-probe --control-tests --i-understand-this-may-move-the-belt
 
@@ -75,6 +79,10 @@ struct Arguments {
                 workouts. It records raw FTMS flags, bytes, elapsed time, and
                 remaining time without sending treadmill control commands.
 
+                vitalwalk-probe runs a guided low-speed diagnostic for Vitalwalk
+                speed units, native increments, pause, resume, incline, and steps.
+                It requires runtime confirmation because it moves the belt.
+
                 r3-probe runs a WalkingPad R3 diagnostic. Safe mode sends FTMS
                 Request Control and known KingSmith supplement init/query commands,
                 but does not start the belt or change speed. Control tests require
@@ -86,9 +94,9 @@ struct Arguments {
             }
         }
 
-        let requestedModes = [requestedR3Probe, requestedInteractiveProbe, requestedTimeProbe].filter { $0 }.count
+        let requestedModes = [requestedR3Probe, requestedInteractiveProbe, requestedTimeProbe, requestedVitalwalkProbe].filter { $0 }.count
         if requestedModes > 1 {
-            fputs("r3-probe, time-probe, and --probe cannot be combined\n", stderr)
+            fputs("r3-probe, time-probe, vitalwalk-probe, and --probe cannot be combined\n", stderr)
             exit(2)
         }
         if !requestedR3Probe, result.r3ControlTests {
@@ -106,6 +114,8 @@ struct Arguments {
             result.mode = .interactiveProbe
         } else if requestedTimeProbe {
             result.mode = .timeProbe
+        } else if requestedVitalwalkProbe {
+            result.mode = .vitalwalkProbe
         }
 
         return result
@@ -116,6 +126,7 @@ enum CaptureMode {
     case guidedCapture
     case interactiveProbe
     case timeProbe
+    case vitalwalkProbe
     case r3Probe(duration: TimeInterval, controlTests: Bool)
 }
 
@@ -155,6 +166,9 @@ final class BLECapture: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
     private var phaseStats: [String: PhaseStats] = [:]
     private var totalTreadmillDataPackets = 0
     private var r3ProbeState = R3ProbeState()
+    private var vitalwalkProbeState = VitalwalkProbeState()
+    private var vitalwalkMovementPossible = false
+    private var vitalwalkExitCode: Int32 = 0
     private var sawNonzeroSpeed = false
     private var sawDistanceIncrease = false
     private var sawElapsedTimeIncrease = false
@@ -181,6 +195,8 @@ final class BLECapture: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
         var ftmsVendorField: UInt16?
         var fitshowSteps: UInt16?
         var machineStatusOpcode: String?
+        var machineStatusParametersHex: String?
+        var trainingStatus: String?
     }
 
     private struct CapturePhase {
@@ -208,6 +224,18 @@ final class BLECapture: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
         let instruction: String
         let fields: [String: Any]
         let duration: TimeInterval
+    }
+
+    private struct VitalwalkProbeState {
+        var displayUnit: VitalwalkDisplayUnit?
+        var targets: VitalwalkProbeTargets?
+        var commandResults: [[String: Any]] = []
+        var speedSamples: [[String: Any]] = []
+        var inclineObservation: [String: Any]?
+        var pauseObservation: String?
+        var resumeObservation: String?
+        var finalDisplayValues: [String: Any] = [:]
+        var abortedReason: String?
     }
 
     private struct R3ProbeState {
@@ -263,6 +291,7 @@ final class BLECapture: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
         case .guidedCapture: "guidedCapture"
         case .interactiveProbe: "interactiveProbe"
         case .timeProbe: "timeProbe"
+        case .vitalwalkProbe: "vitalwalkProbe"
         case let .r3Probe(_, controlTests): controlTests ? "r3ProbeControlTests" : "r3Probe"
         }
     }
@@ -300,7 +329,7 @@ final class BLECapture: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
     }
 
     func centralManager(
-        _ central: CBCentralManager,
+        _: CBCentralManager,
         didDiscover peripheral: CBPeripheral,
         advertisementData: [String: Any],
         rssi RSSI: NSNumber
@@ -327,7 +356,7 @@ final class BLECapture: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
         ])
     }
 
-    func centralManager(_ central: CBCentralManager, didConnect peripheral: CBPeripheral) {
+    func centralManager(_: CBCentralManager, didConnect peripheral: CBPeripheral) {
         print("Connected to \(peripheral.name ?? "device"). Discovering services...")
         startDiscoveryTimeout(reason: "discovery_timeout")
         logger.write("ble.connect", [
@@ -340,7 +369,7 @@ final class BLECapture: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
         peripheral.discoverServices(nil)
     }
 
-    func centralManager(_ central: CBCentralManager, didFailToConnect peripheral: CBPeripheral, error: Error?) {
+    func centralManager(_: CBCentralManager, didFailToConnect peripheral: CBPeripheral, error: Error?) {
         logger.write("ble.connect_failed", [
             "id": peripheral.identifier.uuidString,
             "name": peripheral.name ?? "Unknown",
@@ -350,13 +379,16 @@ final class BLECapture: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
         finish(1)
     }
 
-    func centralManager(_ central: CBCentralManager, didDisconnectPeripheral peripheral: CBPeripheral, error: Error?) {
+    func centralManager(_: CBCentralManager, didDisconnectPeripheral peripheral: CBPeripheral, error: Error?) {
         logger.write("ble.disconnect", [
             "id": peripheral.identifier.uuidString,
             "name": peripheral.name ?? "Unknown",
             "error": error?.localizedDescription ?? "none",
         ])
         print("Disconnected. Log saved to \(logger.path)")
+        if case .vitalwalkProbe = mode {
+            finish(vitalwalkExitCode)
+        }
         finish(0)
     }
 
@@ -437,10 +469,9 @@ final class BLECapture: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
                 peripheral.readValue(for: characteristic)
             }
         }
-
     }
 
-    func peripheral(_ peripheral: CBPeripheral, didUpdateNotificationStateFor characteristic: CBCharacteristic, error: Error?) {
+    func peripheral(_: CBPeripheral, didUpdateNotificationStateFor characteristic: CBCharacteristic, error: Error?) {
         let key = characteristicKey(characteristic)
         pendingNotifyEnables.remove(key)
         if characteristic.isNotifying {
@@ -457,7 +488,7 @@ final class BLECapture: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
         checkSetupComplete()
     }
 
-    func peripheral(_ peripheral: CBPeripheral, didWriteValueFor characteristic: CBCharacteristic, error: Error?) {
+    func peripheral(_: CBPeripheral, didWriteValueFor characteristic: CBCharacteristic, error: Error?) {
         logger.write(error == nil ? "ble.tx_result" : "ble.tx_error", [
             "service": characteristic.service?.uuid.uuidString ?? "unknown",
             "characteristic": characteristic.uuid.uuidString,
@@ -495,7 +526,7 @@ final class BLECapture: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
         }
     }
 
-    func peripheral(_ peripheral: CBPeripheral, didUpdateValueFor characteristic: CBCharacteristic, error: Error?) {
+    func peripheral(_: CBPeripheral, didUpdateValueFor characteristic: CBCharacteristic, error: Error?) {
         let key = characteristicKey(characteristic)
         let wasReadRequest = readRequests.remove(key) != nil
         defer {
@@ -578,6 +609,8 @@ final class BLECapture: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
             updateTreadmillDataState(decoded)
         case CBUUID(string: "2ADA"):
             updateMachineStatusState(decoded)
+        case CBUUID(string: "2AD3"):
+            latestStatus.trainingStatus = decoded["trainingStatus"] as? String
         case CBUUID(string: "2ACC"):
             if let fitnessMachineFeatures = decoded["fitnessMachineFeaturesRaw"] as? UInt32,
                let targetSettingFeatures = decoded["targetSettingFeaturesRaw"] as? UInt32
@@ -684,6 +717,7 @@ final class BLECapture: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
         }
         lastMachineStatusOpcode = opcode
         latestStatus.machineStatusOpcode = opcode
+        latestStatus.machineStatusParametersHex = ftms["machineStatusParametersHex"] as? String
 
         guard let phase = currentPhase else { return }
         var stats = phaseStats[phase.id] ?? PhaseStats()
@@ -766,8 +800,668 @@ final class BLECapture: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
                 self.startProbeMode()
             case .timeProbe:
                 self.startTimeProbe()
+            case .vitalwalkProbe:
+                self.startVitalwalkProbe()
             case let .r3Probe(duration, controlTests):
                 self.startR3Probe(duration: duration, controlTests: controlTests)
+            }
+        }
+    }
+
+    private func startVitalwalkProbe() {
+        discoveryTimeout?.invalidate()
+        print("")
+        print("Vitalwalk one-run diagnostic")
+        print("This probe tests speed units, one native speed increment, incline, pause, resume, and displayed totals.")
+        print("The belt will run only at the reported minimum speed and one increment above it.")
+        print("")
+
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            self?.runVitalwalkProbe()
+        }
+    }
+
+    private func runVitalwalkProbe() {
+        guard waitForVitalwalkPrerequisites() else {
+            abortVitalwalkProbe(reason: "prerequisites_unavailable", attemptStop: false)
+            return
+        }
+        guard let speedRange, let targets = VitalwalkProbeTargets.make(from: speedRange) else {
+            abortVitalwalkProbe(reason: "invalid_speed_range", attemptStop: false)
+            return
+        }
+        vitalwalkProbeState.targets = targets
+
+        guard let unit = promptVitalwalkDisplayUnit() else {
+            abortVitalwalkProbe(reason: "input_closed", attemptStop: false)
+            return
+        }
+        vitalwalkProbeState.displayUnit = unit
+        logger.write("vitalwalk_probe.context", [
+            "displayUnit": unit.rawValue,
+            "minimumRaw": targets.minimumRaw,
+            "incrementRaw": targets.incrementRaw,
+            "incrementedRaw": targets.incrementedRaw,
+            "speedRangeMinimumRaw": speedRange.minimumKmh,
+            "speedRangeMaximumRaw": speedRange.maximumKmh,
+            "speedRangeIncrementRaw": speedRange.incrementKmh,
+            "fitshowServicePresent": selectedServices.contains(CBUUID(string: "FFF0")),
+        ])
+
+        print("")
+        print("SAFETY CHECK")
+        print("Stand off the belt, keep the physical stop control reachable, and keep the treadmill clear.")
+        print("The probe always attempts FTMS Stop on failure, interruption, and normal completion.")
+        print("Type RUN VITALWALK PROBE exactly to continue:")
+        guard readLine()?.trimmingCharacters(in: .whitespacesAndNewlines) == "RUN VITALWALK PROBE" else {
+            abortVitalwalkProbe(reason: "runtime_confirmation_declined", attemptStop: false)
+            return
+        }
+
+        guard requireVitalwalkCommand(
+            name: "request_control",
+            payload: FTMSCommand.requestControl.payload,
+            opcode: FTMSCommand.requestControl.requestOpcode
+        ) else {
+            abortVitalwalkProbe(reason: "request_control_failed", attemptStop: false)
+            return
+        }
+        guard requireVitalwalkCommand(
+            name: "initial_stop",
+            payload: FTMSCommand.stop.payload,
+            opcode: FTMSCommand.stop.requestOpcode
+        ) else {
+            abortVitalwalkProbe(reason: "initial_stop_failed", attemptStop: true)
+            return
+        }
+        let initiallyStopped = waitForVitalwalkBeltToStop(timeout: 8)
+        guard confirmVitalwalkBeltStoppedIfNeeded(
+            telemetryStopped: initiallyStopped,
+            context: "before setting the initial speed target"
+        ) else {
+            abortVitalwalkProbe(reason: "initial_physical_stop_not_confirmed", attemptStop: true)
+            return
+        }
+
+        let minimumCommand = FTMSCommand.speed(requestedKmh: targets.minimumRaw, range: speedRange)
+        guard let minimumCommand,
+              requireVitalwalkCommand(
+                  name: "set_speed_minimum_raw",
+                  payload: minimumCommand.payload,
+                  opcode: minimumCommand.requestOpcode,
+                  fields: ["rawTarget": targets.minimumRaw]
+              )
+        else {
+            abortVitalwalkProbe(reason: "minimum_speed_target_failed", attemptStop: false)
+            return
+        }
+
+        vitalwalkMovementPossible = true
+        guard requireVitalwalkCommand(
+            name: "start_at_minimum",
+            payload: FTMSCommand.start.payload,
+            opcode: FTMSCommand.start.requestOpcode
+        ) else {
+            abortVitalwalkProbe(reason: "start_failed", attemptStop: true)
+            return
+        }
+
+        print("Waiting 8 seconds for minimum speed to stabilize...")
+        Thread.sleep(forTimeInterval: 8)
+        guard let minimumDisplay = promptRequiredDouble(
+            "Enter the exact speed shown on the treadmill display at minimum (number only):"
+        ) else {
+            abortVitalwalkProbe(reason: "minimum_display_value_missing", attemptStop: true)
+            return
+        }
+        recordVitalwalkSpeedSample(rawTarget: targets.minimumRaw, physicalDisplayValue: minimumDisplay, unit: unit, phase: "minimum")
+
+        let incrementedCommand = FTMSCommand.speed(requestedKmh: targets.incrementedRaw, range: speedRange)
+        guard let incrementedCommand,
+              requireVitalwalkCommand(
+                  name: "set_speed_one_increment_raw",
+                  payload: incrementedCommand.payload,
+                  opcode: incrementedCommand.requestOpcode,
+                  fields: ["rawTarget": targets.incrementedRaw, "rawIncrement": targets.incrementRaw]
+              )
+        else {
+            abortVitalwalkProbe(reason: "incremented_speed_target_failed", attemptStop: true)
+            return
+        }
+
+        print("Waiting 6 seconds for the one-increment speed to stabilize...")
+        Thread.sleep(forTimeInterval: 6)
+        guard let incrementedDisplay = promptRequiredDouble(
+            "Enter the exact speed shown after one native increment (number only):"
+        ) else {
+            abortVitalwalkProbe(reason: "incremented_display_value_missing", attemptStop: true)
+            return
+        }
+        recordVitalwalkSpeedSample(rawTarget: targets.incrementedRaw, physicalDisplayValue: incrementedDisplay, unit: unit, phase: "one_increment")
+
+        guard requireVitalwalkCommand(
+            name: "restore_speed_minimum_raw",
+            payload: minimumCommand.payload,
+            opcode: minimumCommand.requestOpcode,
+            fields: ["rawTarget": targets.minimumRaw]
+        ) else {
+            abortVitalwalkProbe(reason: "restore_minimum_speed_failed", attemptStop: true)
+            return
+        }
+        Thread.sleep(forTimeInterval: 4)
+
+        runVitalwalkInclineTestIfAvailable()
+
+        let pauseResult = sendVitalwalkCommand(name: "pause", payload: FTMSCommand.pause.payload, opcode: FTMSCommand.pause.requestOpcode)
+        recordVitalwalkCommandResult(pauseResult)
+        print("Waiting 6 seconds after FTMS Pause...")
+        Thread.sleep(forTimeInterval: 6)
+        guard let pauseObservation = promptRequiredText(
+            "Describe exactly what Pause did (for example: stopped, slowed, or no visible change):"
+        ) else {
+            abortVitalwalkProbe(reason: "pause_observation_missing", attemptStop: true)
+            return
+        }
+        vitalwalkProbeState.pauseObservation = pauseObservation
+        logger.write("vitalwalk_probe.pause_observation", [
+            "observation": pauseObservation,
+            "snapshot": vitalwalkSnapshot(),
+            "commandResult": pauseResult.dictionary,
+        ])
+
+        let stopAfterPause = sendVitalwalkCommand(
+            name: "stop_after_pause",
+            payload: FTMSCommand.stop.payload,
+            opcode: FTMSCommand.stop.requestOpcode
+        )
+        recordVitalwalkCommandResult(stopAfterPause)
+        let stoppedAfterPause = waitForVitalwalkBeltToStop(timeout: 12)
+
+        guard stopAfterPause.succeeded else {
+            abortVitalwalkProbe(reason: "stop_after_pause_failed", attemptStop: true)
+            return
+        }
+        guard confirmVitalwalkBeltStoppedIfNeeded(
+            telemetryStopped: stoppedAfterPause,
+            context: "before the resume test"
+        ) else {
+            abortVitalwalkProbe(reason: "physical_stop_not_confirmed", attemptStop: true)
+            return
+        }
+
+        let resumeResult = sendVitalwalkCommand(
+            name: "start_after_stop",
+            payload: FTMSCommand.start.payload,
+            opcode: FTMSCommand.start.requestOpcode
+        )
+        recordVitalwalkCommandResult(resumeResult)
+        guard resumeResult.succeeded else {
+            abortVitalwalkProbe(reason: "resume_after_stop_failed", attemptStop: true)
+            return
+        }
+
+        print("Waiting 8 seconds to observe Start after Stop...")
+        Thread.sleep(forTimeInterval: 8)
+        guard let resumeObservation = promptRequiredText(
+            "Describe what Start did after Stop, including the displayed speed:"
+        ) else {
+            abortVitalwalkProbe(reason: "resume_observation_missing", attemptStop: true)
+            return
+        }
+        vitalwalkProbeState.resumeObservation = resumeObservation
+        logger.write("vitalwalk_probe.resume_observation", [
+            "observation": resumeObservation,
+            "snapshot": vitalwalkSnapshot(),
+            "commandResult": resumeResult.dictionary,
+        ])
+
+        print("")
+        print("Enter the values visible on the treadmill before it is stopped.")
+        vitalwalkProbeState.finalDisplayValues = [
+            "steps": promptOptionalDouble("Displayed steps (number, or unknown):") ?? NSNull(),
+            "distance": promptOptionalDouble("Displayed distance (number, or unknown):") ?? NSNull(),
+            "calories": promptOptionalDouble("Displayed calories (number, or unknown):") ?? NSNull(),
+            "speed": promptOptionalDouble("Displayed speed (number, or unknown):") ?? NSNull(),
+            "displayUnit": unit.rawValue,
+        ]
+        logger.write("vitalwalk_probe.final_display", [
+            "values": vitalwalkProbeState.finalDisplayValues,
+            "snapshot": vitalwalkSnapshot(),
+        ])
+
+        let finalStop = sendVitalwalkCommand(
+            name: "final_stop",
+            payload: FTMSCommand.stop.payload,
+            opcode: FTMSCommand.stop.requestOpcode
+        )
+        recordVitalwalkCommandResult(finalStop)
+        let stoppedAtCompletion = waitForVitalwalkBeltToStop(timeout: 12)
+        guard finalStop.succeeded else {
+            abortVitalwalkProbe(reason: "final_stop_failed", attemptStop: true)
+            return
+        }
+        guard confirmVitalwalkBeltStoppedIfNeeded(
+            telemetryStopped: stoppedAtCompletion,
+            context: "before the probe exits"
+        ) else {
+            abortVitalwalkProbe(reason: "final_physical_stop_not_confirmed", attemptStop: true)
+            return
+        }
+        vitalwalkMovementPossible = false
+
+        finishVitalwalkProbe()
+    }
+
+    private func waitForVitalwalkPrerequisites() -> Bool {
+        for attempt in 1 ... 6 {
+            var missing: [String] = []
+            DispatchQueue.main.sync {
+                if !selectedServices.contains(CBUUID(string: "1826")) { missing.append("FTMS service 1826") }
+                if speedRange == nil { missing.append("Supported Speed Range 2AD4") }
+                if feature == nil { missing.append("Fitness Machine Feature 2ACC") }
+                if !notifiedCharacteristics.contains(where: { $0.hasSuffix("/2ACD") }) {
+                    missing.append("Treadmill Data notifications 2ACD")
+                }
+                if let controlPointCharacteristic {
+                    if !controlPointCharacteristic.properties.contains(.write) { missing.append("2AD9 write-with-response") }
+                    if !controlPointCharacteristic.properties.contains(.indicate) { missing.append("2AD9 indication property") }
+                    if !notifiedCharacteristics.contains(characteristicKey(controlPointCharacteristic)) {
+                        missing.append("2AD9 indications enabled")
+                    }
+                } else {
+                    missing.append("FTMS Control Point 2AD9")
+                }
+            }
+
+            if missing.isEmpty,
+               let feature,
+               feature.targetSettingFeatures & 0x0000_0001 != 0,
+               let speedRange,
+               VitalwalkProbeTargets.make(from: speedRange) != nil
+            {
+                logger.write("vitalwalk_probe.preflight", [
+                    "status": "ready",
+                    "attempt": attempt,
+                    "feature": [
+                        "fitnessMachineFeatures": String(format: "0x%08X", feature.fitnessMachineFeatures),
+                        "targetSettingFeatures": String(format: "0x%08X", feature.targetSettingFeatures),
+                    ],
+                    "speedRange": [
+                        "minimumRaw": speedRange.minimumKmh,
+                        "maximumRaw": speedRange.maximumKmh,
+                        "incrementRaw": speedRange.incrementKmh,
+                    ],
+                    "inclineRangeKnown": inclineRange != nil,
+                    "fitshowServicePresent": selectedServices.contains(CBUUID(string: "FFF0")),
+                ])
+                return true
+            }
+
+            if let feature, feature.targetSettingFeatures & 0x0000_0001 == 0 {
+                missing.append("speed target feature")
+            }
+            logger.write("vitalwalk_probe.preflight", [
+                "status": attempt == 6 ? "failed" : "waiting",
+                "attempt": attempt,
+                "missing": missing,
+            ])
+            if attempt == 6 {
+                print("Vitalwalk probe cannot run safely. Missing: \(missing.joined(separator: ", "))")
+                return false
+            }
+
+            DispatchQueue.main.sync {
+                rereadVitalwalkPrerequisites()
+            }
+            Thread.sleep(forTimeInterval: 2)
+        }
+        return false
+    }
+
+    private func rereadVitalwalkPrerequisites() {
+        guard let selected else { return }
+        for uuid in ["2ACC", "2AD4", "2AD5"] {
+            guard let characteristic = findCharacteristic(uuid: CBUUID(string: uuid), in: selected),
+                  characteristic.properties.contains(.read)
+            else { continue }
+            logger.write("vitalwalk_probe.read_retry", [
+                "characteristic": uuid,
+                "service": characteristic.service?.uuid.uuidString ?? "unknown",
+            ])
+            readRequests.insert(characteristicKey(characteristic))
+            selected.readValue(for: characteristic)
+        }
+    }
+
+    private func promptVitalwalkDisplayUnit() -> VitalwalkDisplayUnit? {
+        while true {
+            print("Does the treadmill display speed in mph or km/h?")
+            guard let input = readLine() else { return nil }
+            if let unit = VitalwalkDisplayUnit.parse(input) { return unit }
+            print("Enter mph or km/h.")
+        }
+    }
+
+    private func promptRequiredDouble(_ prompt: String) -> Double? {
+        while true {
+            print(prompt)
+            guard let input = readLine() else { return nil }
+            if let value = Double(input.trimmingCharacters(in: .whitespacesAndNewlines)), value.isFinite, value >= 0 {
+                return value
+            }
+            print("Enter a non-negative number.")
+        }
+    }
+
+    private func promptOptionalDouble(_ prompt: String) -> Double? {
+        while true {
+            print(prompt)
+            guard let input = readLine() else { return nil }
+            let normalized = input.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            if normalized == "unknown" || normalized.isEmpty { return nil }
+            if let value = Double(normalized), value.isFinite, value >= 0 { return value }
+            print("Enter a non-negative number or unknown.")
+        }
+    }
+
+    private func promptRequiredText(_ prompt: String) -> String? {
+        while true {
+            print(prompt)
+            guard let input = readLine() else { return nil }
+            let normalized = input.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !normalized.isEmpty { return normalized }
+            print("Enter what you observed so it is recorded in the trace.")
+        }
+    }
+
+    private func requireVitalwalkCommand(
+        name: String,
+        payload: Data,
+        opcode: UInt8,
+        fields: [String: Any] = [:]
+    ) -> Bool {
+        let result = sendVitalwalkCommand(name: name, payload: payload, opcode: opcode, fields: fields)
+        recordVitalwalkCommandResult(result, fields: fields)
+        if !result.succeeded {
+            print("Command \(name) failed or timed out. The probe will stop safely.")
+        }
+        return result.succeeded
+    }
+
+    private func recordVitalwalkCommandResult(
+        _ result: VitalwalkCommandResult,
+        fields: [String: Any] = [:]
+    ) {
+        vitalwalkProbeState.commandResults.append(result.dictionary)
+        logger.write(
+            "vitalwalk_probe.command_result",
+            result.dictionary.merging(fields) { current, _ in current }
+        )
+    }
+
+    private func sendVitalwalkCommand(
+        name: String,
+        payload: Data,
+        opcode: UInt8,
+        fields: [String: Any] = [:],
+        timeout: TimeInterval = 5
+    ) -> VitalwalkCommandResult {
+        var responseStart = 0
+        var canSend = false
+        DispatchQueue.main.sync {
+            responseStart = r3ProbeState.controlPointResponses.count
+            guard let selected, let controlPointCharacteristic else { return }
+            canSend = true
+            logger.write("vitalwalk_probe.tx", [
+                "name": name,
+                "requestOpcode": String(format: "0x%02X", opcode),
+                "hex": payload.hexString,
+                "fields": fields,
+            ])
+            selected.writeValue(payload, for: controlPointCharacteristic, type: .withResponse)
+        }
+
+        guard canSend else {
+            return VitalwalkCommandResult(
+                name: name,
+                requestOpcode: opcode,
+                resultCode: nil,
+                responseHex: nil,
+                timedOut: false
+            )
+        }
+
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            var response: [String: Any]?
+            DispatchQueue.main.sync {
+                response = r3ProbeState.controlPointResponses
+                    .dropFirst(responseStart)
+                    .first { $0["requestOpcodeRaw"] as? UInt8 == opcode }
+            }
+            if let response {
+                let resultCode = parseHexByte(response["resultCode"] as? String)
+                if opcode == 0x00, resultCode == 0x01 {
+                    DispatchQueue.main.sync { controlAcquired = true }
+                }
+                return VitalwalkCommandResult(
+                    name: name,
+                    requestOpcode: opcode,
+                    resultCode: resultCode,
+                    responseHex: response["hex"] as? String,
+                    timedOut: false
+                )
+            }
+            Thread.sleep(forTimeInterval: 0.05)
+        }
+
+        return VitalwalkCommandResult(
+            name: name,
+            requestOpcode: opcode,
+            resultCode: nil,
+            responseHex: nil,
+            timedOut: true
+        )
+    }
+
+    private func parseHexByte(_ value: String?) -> UInt8? {
+        guard let value else { return nil }
+        return UInt8(value.replacingOccurrences(of: "0x", with: ""), radix: 16)
+    }
+
+    private func recordVitalwalkSpeedSample(
+        rawTarget: Double,
+        physicalDisplayValue: Double,
+        unit: VitalwalkDisplayUnit,
+        phase: String
+    ) {
+        let reportedSpeed = DispatchQueue.main.sync { latestStatus.speedKmh }
+        let sample = VitalwalkSpeedSample(
+            rawTarget: rawTarget,
+            reportedSpeedKmh: reportedSpeed,
+            physicalDisplayValue: physicalDisplayValue,
+            physicalDisplayUnit: unit
+        )
+        let record = sample.dictionary.merging([
+            "phase": phase,
+            "snapshot": vitalwalkSnapshot(),
+        ]) { current, _ in current }
+        vitalwalkProbeState.speedSamples.append(record)
+        logger.write("vitalwalk_probe.speed_sample", record)
+    }
+
+    private func runVitalwalkInclineTestIfAvailable() {
+        guard let inclineRange,
+              inclineRange.isSupported,
+              inclineRange.incrementPercent > 0,
+              (feature?.targetSettingFeatures ?? 0) & 0x0000_0002 != 0
+        else {
+            logger.write("vitalwalk_probe.incline", ["status": "unsupported_or_unknown"])
+            return
+        }
+
+        print("")
+        print("Incline support was reported as \(inclineRange.minimumPercent)...\(inclineRange.maximumPercent)% in \(inclineRange.incrementPercent)% steps.")
+        print("Test one incline increment while the belt remains at minimum speed? Type yes or no:")
+        guard readLine()?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "yes" else {
+            logger.write("vitalwalk_probe.incline", ["status": "user_skipped"])
+            return
+        }
+
+        let minimum = FTMSCommand.incline(requestedPercent: inclineRange.minimumPercent, range: inclineRange)
+        let incremented = FTMSCommand.incline(
+            requestedPercent: inclineRange.minimumPercent + inclineRange.incrementPercent,
+            range: inclineRange
+        )
+        guard let minimum, let incremented,
+              requireVitalwalkCommand(
+                  name: "set_incline_minimum",
+                  payload: minimum.payload,
+                  opcode: minimum.requestOpcode,
+                  fields: ["targetPercent": minimum.target ?? inclineRange.minimumPercent]
+              ),
+              requireVitalwalkCommand(
+                  name: "set_incline_one_increment",
+                  payload: incremented.payload,
+                  opcode: incremented.requestOpcode,
+                  fields: ["targetPercent": incremented.target ?? inclineRange.minimumPercent + inclineRange.incrementPercent]
+              )
+        else {
+            logger.write("vitalwalk_probe.incline", ["status": "command_failed"])
+            return
+        }
+
+        Thread.sleep(forTimeInterval: 5)
+        let displayed = promptOptionalDouble("Displayed incline after one increment (number, or unknown):")
+        let record: [String: Any] = [
+            "status": "tested",
+            "minimumPercent": inclineRange.minimumPercent,
+            "incrementPercent": inclineRange.incrementPercent,
+            "targetPercent": incremented.target ?? NSNull(),
+            "physicalDisplayPercent": displayed ?? NSNull(),
+            "snapshot": vitalwalkSnapshot(),
+        ]
+        vitalwalkProbeState.inclineObservation = record
+        logger.write("vitalwalk_probe.incline", record)
+        _ = requireVitalwalkCommand(
+            name: "restore_incline_minimum",
+            payload: minimum.payload,
+            opcode: minimum.requestOpcode,
+            fields: ["targetPercent": minimum.target ?? inclineRange.minimumPercent]
+        )
+    }
+
+    private func vitalwalkSnapshot() -> [String: Any] {
+        DispatchQueue.main.sync {
+            [
+                "speedKmh": latestStatus.speedKmh ?? NSNull(),
+                "speedMph": latestStatus.speedKmh.map { $0 / 1.609_344 } ?? NSNull(),
+                "distanceMeters": latestStatus.distanceMeters ?? NSNull(),
+                "elapsedSeconds": latestStatus.elapsedSeconds ?? NSNull(),
+                "inclinePercent": latestStatus.inclinePercent ?? NSNull(),
+                "ftmsVendorField": latestStatus.ftmsVendorField ?? NSNull(),
+                "fitshowSteps": latestStatus.fitshowSteps ?? NSNull(),
+                "machineStatusOpcode": latestStatus.machineStatusOpcode ?? "unknown",
+                "machineStatusParametersHex": latestStatus.machineStatusParametersHex ?? "unknown",
+                "trainingStatus": latestStatus.trainingStatus ?? "unknown",
+            ]
+        }
+    }
+
+    private func waitForVitalwalkBeltToStop(timeout: TimeInterval) -> Bool {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            let speed = DispatchQueue.main.sync { latestStatus.speedKmh }
+            if speed == 0 { return true }
+            Thread.sleep(forTimeInterval: 0.25)
+        }
+        logger.write("vitalwalk_probe.warning", [
+            "reason": "belt_stop_not_observed",
+            "snapshot": vitalwalkSnapshot(),
+        ])
+        return false
+    }
+
+    private func confirmVitalwalkBeltStoppedIfNeeded(telemetryStopped: Bool, context: String) -> Bool {
+        guard !telemetryStopped else { return true }
+
+        print("")
+        print("TreadmillTrace could not verify zero belt speed from telemetry.")
+        print("Use the physical stop control. Type STOPPED only after the belt is fully stopped \(context):")
+        let confirmed = readLine()?.trimmingCharacters(in: .whitespacesAndNewlines) == "STOPPED"
+        logger.write("vitalwalk_probe.physical_stop_confirmation", [
+            "confirmed": confirmed,
+            "context": context,
+            "snapshot": vitalwalkSnapshot(),
+        ])
+        return confirmed
+    }
+
+    private func abortVitalwalkProbe(reason: String, attemptStop: Bool) {
+        vitalwalkExitCode = 1
+        vitalwalkProbeState.abortedReason = reason
+        logger.write("vitalwalk_probe.aborted", [
+            "reason": reason,
+            "attemptStop": attemptStop,
+            "snapshot": vitalwalkSnapshot(),
+        ])
+        if attemptStop {
+            let result = sendVitalwalkCommand(
+                name: "emergency_stop",
+                payload: FTMSCommand.stop.payload,
+                opcode: FTMSCommand.stop.requestOpcode,
+                timeout: 3
+            )
+            recordVitalwalkCommandResult(result)
+            let stopped = waitForVitalwalkBeltToStop(timeout: 8)
+            _ = confirmVitalwalkBeltStoppedIfNeeded(
+                telemetryStopped: stopped,
+                context: "before the probe exits"
+            )
+        }
+        vitalwalkMovementPossible = false
+        finishVitalwalkProbe()
+    }
+
+    private func finishVitalwalkProbe() {
+        let summary: [String: Any] = [
+            "completed": vitalwalkProbeState.abortedReason == nil,
+            "abortedReason": vitalwalkProbeState.abortedReason ?? NSNull(),
+            "displayUnit": vitalwalkProbeState.displayUnit?.rawValue ?? "unknown",
+            "targets": vitalwalkProbeState.targets.map {
+                [
+                    "minimumRaw": $0.minimumRaw,
+                    "incrementRaw": $0.incrementRaw,
+                    "incrementedRaw": $0.incrementedRaw,
+                ]
+            } ?? NSNull(),
+            "commandResults": vitalwalkProbeState.commandResults,
+            "speedSamples": vitalwalkProbeState.speedSamples,
+            "inclineObservation": vitalwalkProbeState.inclineObservation ?? NSNull(),
+            "pauseObservation": vitalwalkProbeState.pauseObservation ?? NSNull(),
+            "resumeObservation": vitalwalkProbeState.resumeObservation ?? NSNull(),
+            "finalDisplayValues": vitalwalkProbeState.finalDisplayValues,
+            "finalSnapshot": vitalwalkSnapshot(),
+        ]
+        logger.write("vitalwalk_probe.summary", summary)
+
+        print("")
+        print("===== Vitalwalk Probe Report =====")
+        print("Completed: \(vitalwalkProbeState.abortedReason == nil ? "yes" : "no")")
+        if let reason = vitalwalkProbeState.abortedReason { print("Stopped because: \(reason)") }
+        print("Speed samples captured: \(vitalwalkProbeState.speedSamples.count)")
+        print("Pause observation captured: \(vitalwalkProbeState.pauseObservation != nil ? "yes" : "no")")
+        print("Resume observation captured: \(vitalwalkProbeState.resumeObservation != nil ? "yes" : "no")")
+        print("Log file: \(logger.path)")
+        print("Send this JSONL file with the issue report.")
+        print("==================================")
+
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            if let selected {
+                central.cancelPeripheralConnection(selected)
+            } else {
+                finish(vitalwalkProbeState.abortedReason == nil ? 0 : 1)
             }
         }
     }
@@ -1132,6 +1826,17 @@ final class BLECapture: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
         return string
     }
 
+    private func attemptVitalwalkEmergencyStopFromMain(reason: String) {
+        guard let selected, let controlPointCharacteristic else { return }
+        let payload = FTMSCommand.stop.payload
+        logger.write("vitalwalk_probe.emergency_stop", [
+            "reason": reason,
+            "hex": payload.hexString,
+        ])
+        selected.writeValue(payload, for: controlPointCharacteristic, type: .withResponse)
+        vitalwalkMovementPossible = false
+    }
+
     private func setupSignalHandlers() {
         for signalNumber in [SIGINT, SIGTERM] {
             signal(signalNumber, SIG_IGN)
@@ -1139,8 +1844,17 @@ final class BLECapture: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
             source.setEventHandler { [weak self] in
                 guard let self else { exit(1) }
                 print("\nInterrupted. Closing log...")
-                self.logger.write("session.end", ["reason": "interrupted", "signal": signalNumber])
-                self.finish(1)
+                if self.vitalwalkMovementPossible, case .vitalwalkProbe = self.mode {
+                    self.attemptVitalwalkEmergencyStopFromMain(reason: "signal_\(signalNumber)")
+                    Timer.scheduledTimer(withTimeInterval: 1.0, repeats: false) { [weak self] _ in
+                        guard let self else { exit(1) }
+                        self.logger.write("session.end", ["reason": "interrupted", "signal": signalNumber])
+                        self.finish(1)
+                    }
+                } else {
+                    self.logger.write("session.end", ["reason": "interrupted", "signal": signalNumber])
+                    self.finish(1)
+                }
             }
             source.resume()
             signalSources.append(source)
@@ -1462,7 +2176,20 @@ final class BLECapture: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
         case CBUUID(string: "2ACD"):
             return FTMSParser.parseTreadmillData(data).dictionary()
         case CBUUID(string: "2ADA"):
-            return ["machineStatusOpcode": data.first.map { String(format: "0x%02X", $0) } ?? "none"]
+            let opcode = data.first
+            let parameters = data.count > 1 ? Data(data.dropFirst()).hexString : ""
+            return [
+                "machineStatusOpcode": opcode.map { String(format: "0x%02X", $0) } ?? "none",
+                "machineStatusName": opcode.map(machineStatusName) ?? "none",
+                "machineStatusParametersHex": parameters,
+            ]
+        case CBUUID(string: "2AD3"):
+            let status = data.count >= 2 ? data[1] : data.first
+            return [
+                "trainingStatusFlags": data.first.map { String(format: "0x%02X", $0) } ?? "none",
+                "trainingStatusRaw": status.map { String(format: "0x%02X", $0) } ?? "none",
+                "trainingStatus": status.map(trainingStatusName) ?? "none",
+            ]
         case CBUUID(string: "2AD9"):
             return [
                 "controlPointResponse": data.count >= 3 && data[0] == 0x80,
@@ -1549,6 +2276,30 @@ final class BLECapture: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
             return ["utf8": String(data: data, encoding: .utf8) ?? "invalid_utf8"]
         default:
             return [:]
+        }
+    }
+
+    private func machineStatusName(_ opcode: UInt8) -> String {
+        switch opcode {
+        case 0x01: "reset"
+        case 0x02: "stoppedOrPausedByUser"
+        case 0x03: "stoppedBySafetyKey"
+        case 0x04: "startedOrResumedByUser"
+        case 0x05: "targetSpeedChanged"
+        case 0x06: "targetInclineChanged"
+        default: "other"
+        }
+    }
+
+    private func trainingStatusName(_ status: UInt8) -> String {
+        switch status {
+        case 0x00: "other"
+        case 0x01: "idle"
+        case 0x02: "warmingUp"
+        case 0x0D: "preWorkout"
+        case 0x0E: "postWorkout"
+        case 0x0F: "paused"
+        default: "status_\(String(format: "%02X", status))"
         }
     }
 
@@ -1680,7 +2431,7 @@ final class BLECapture: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
             handleInclineDelta(-1)
         case .quit:
             quitProbe()
-        case .unknown(let key):
+        case let .unknown(key):
             rejectProbeCommand(key, reason: "unknown_key")
             probeMessage = "Unknown key. Use arrows, a, r, space, s, or q."
         }
@@ -1749,7 +2500,7 @@ final class BLECapture: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
             probeMessage = "Speed range is unknown. Refusing to send speed command."
             return
         }
-        let baseline = lastCommandedSpeedKmh ?? latestStatus.speedKmh ?? speedRange.minimumKmh
+        let baseline = lastCommandedSpeedKmh ?? speedRange.minimumKmh
         guard let command = FTMSCommand.speed(requestedKmh: baseline + direction * speedRange.incrementKmh, range: speedRange) else {
             rejectProbeCommand("speed_delta", reason: "invalid_speed")
             probeMessage = "Invalid speed target."

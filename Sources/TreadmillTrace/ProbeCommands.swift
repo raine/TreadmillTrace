@@ -12,6 +12,7 @@ struct EncodedFTMSCommand: Equatable {
 enum FTMSCommand: Equatable {
     case requestControl
     case start
+    case pause
     case stop
     case speed(EncodedFTMSCommand)
     case incline(EncodedFTMSCommand)
@@ -20,6 +21,7 @@ enum FTMSCommand: Equatable {
         switch self {
         case .requestControl: "request"
         case .start: "start"
+        case .pause: "pause"
         case .stop: "stop"
         case .speed: "speed"
         case .incline: "incline"
@@ -30,8 +32,8 @@ enum FTMSCommand: Equatable {
         switch self {
         case .requestControl: 0x00
         case .start: 0x07
-        case .stop: 0x08
-        case .speed(let command), .incline(let command): command.requestOpcode
+        case .pause, .stop: 0x08
+        case let .speed(command), let .incline(command): command.requestOpcode
         }
     }
 
@@ -39,29 +41,30 @@ enum FTMSCommand: Equatable {
         switch self {
         case .requestControl: Data([0x00])
         case .start: Data([0x07])
+        case .pause: Data([0x08, 0x02])
         case .stop: Data([0x08, 0x01])
-        case .speed(let command), .incline(let command): command.payload
+        case let .speed(command), let .incline(command): command.payload
         }
     }
 
     var target: Double? {
         switch self {
-        case .speed(let command), .incline(let command): command.target
-        case .requestControl, .start, .stop: nil
+        case let .speed(command), let .incline(command): command.target
+        case .requestControl, .start, .pause, .stop: nil
         }
     }
 
     var requested: Double? {
         switch self {
-        case .speed(let command), .incline(let command): command.requested
-        case .requestControl, .start, .stop: nil
+        case let .speed(command), let .incline(command): command.requested
+        case .requestControl, .start, .pause, .stop: nil
         }
     }
 
     var clamped: Bool {
         switch self {
-        case .speed(let command), .incline(let command): command.clamped
-        case .requestControl, .start, .stop: false
+        case let .speed(command), let .incline(command): command.clamped
+        case .requestControl, .start, .pause, .stop: false
         }
     }
 
@@ -115,6 +118,6 @@ enum FTMSCommand: Equatable {
         let clamped = min(max(value, minimum), maximum)
         let steps = ((clamped - minimum) / increment).rounded()
         let rounded = minimum + steps * increment
-        return min(max((rounded * 10_000).rounded() / 10_000, minimum), maximum)
+        return min(max((rounded * 10000).rounded() / 10000, minimum), maximum)
     }
 }

@@ -61,6 +61,7 @@ import Testing
 @Test func encodesBasicControlPointCommands() {
     #expect(FTMSCommand.requestControl.payload == Data([0x00]))
     #expect(FTMSCommand.start.payload == Data([0x07]))
+    #expect(FTMSCommand.pause.payload == Data([0x08, 0x02]))
     #expect(FTMSCommand.stop.payload == Data([0x08, 0x01]))
 }
 
@@ -106,6 +107,14 @@ import Testing
         Issue.record("expected time probe mode")
     }
 
+    let vitalwalk = Arguments.parse(["vitalwalk-probe", "--output", "vitalwalk.jsonl"])
+    #expect(vitalwalk.probeMode == false)
+    if case .vitalwalkProbe = vitalwalk.mode {
+        #expect(vitalwalk.outputPath == "vitalwalk.jsonl")
+    } else {
+        Issue.record("expected Vitalwalk probe mode")
+    }
+
     let r3 = Arguments.parse(["r3-probe", "--duration", "45"])
     #expect(r3.probeMode == false)
     if case let .r3Probe(duration, controlTests) = r3.mode {
@@ -114,6 +123,60 @@ import Testing
     } else {
         Issue.record("expected r3 probe mode")
     }
+}
+
+@Test func plansSafeVitalwalkTargetsFromReportedRange() throws {
+    let range = FTMSSpeedRange(minimumKmh: 0.6, maximumKmh: 5.0, incrementKmh: 0.1)
+
+    let targets = try #require(VitalwalkProbeTargets.make(from: range))
+
+    #expect(targets.minimumRaw == 0.6)
+    #expect(targets.incrementRaw == 0.1)
+    #expect(abs(targets.incrementedRaw - 0.7) < 0.0001)
+    #expect(VitalwalkProbeTargets.make(from: FTMSSpeedRange(
+        minimumKmh: 1,
+        maximumKmh: 1,
+        incrementKmh: 0.1
+    )) == nil)
+}
+
+@Test func infersVitalwalkMphControlBehavior() {
+    let sample = VitalwalkSpeedSample(
+        rawTarget: 4.0,
+        reportedSpeedKmh: 6.44,
+        physicalDisplayValue: 4.0,
+        physicalDisplayUnit: .mph
+    )
+
+    #expect(sample.rawMatchesPhysicalDisplay)
+    #expect(sample.rawBehavesAsMph)
+    #expect(abs((sample.reportedSpeedMph ?? 0) - 4.0) < 0.01)
+}
+
+@Test func parsesVitalwalkDisplayUnit() {
+    #expect(VitalwalkDisplayUnit.parse("mph") == .mph)
+    #expect(VitalwalkDisplayUnit.parse("KM/H") == .kmh)
+    #expect(VitalwalkDisplayUnit.parse("unknown") == nil)
+}
+
+@Test func classifiesVitalwalkCommandResult() {
+    let success = VitalwalkCommandResult(
+        name: "pause",
+        requestOpcode: 0x08,
+        resultCode: 0x01,
+        responseHex: "80 08 01",
+        timedOut: false
+    )
+    let timeout = VitalwalkCommandResult(
+        name: "pause",
+        requestOpcode: 0x08,
+        resultCode: nil,
+        responseHex: nil,
+        timedOut: true
+    )
+
+    #expect(success.succeeded)
+    #expect(!timeout.succeeded)
 }
 
 private extension Data {
