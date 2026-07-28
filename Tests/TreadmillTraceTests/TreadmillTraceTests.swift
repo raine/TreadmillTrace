@@ -115,6 +115,18 @@ import Testing
         Issue.record("expected Vitalwalk probe mode")
     }
 
+    let apolloResume = Arguments.parse([
+        "apollo-resume-probe",
+        "--output",
+        "apollo-resume.jsonl",
+    ])
+    #expect(apolloResume.probeMode == false)
+    if case .apolloResumeProbe = apolloResume.mode {
+        #expect(apolloResume.outputPath == "apollo-resume.jsonl")
+    } else {
+        Issue.record("expected Apollo resume probe mode")
+    }
+
     let r3 = Arguments.parse(["r3-probe", "--duration", "45"])
     #expect(r3.probeMode == false)
     if case let .r3Probe(duration, controlTests) = r3.mode {

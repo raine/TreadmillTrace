@@ -32,6 +32,7 @@ struct Arguments {
         var requestedInteractiveProbe = false
         var requestedTimeProbe = false
         var requestedVitalwalkProbe = false
+        var requestedApolloResumeProbe = false
 
         while let arg = iterator.next() {
             switch arg {
@@ -41,6 +42,8 @@ struct Arguments {
                 requestedTimeProbe = true
             case "vitalwalk-probe":
                 requestedVitalwalkProbe = true
+            case "apollo-resume-probe":
+                requestedApolloResumeProbe = true
             case "--duration":
                 if let value = iterator.next(), let seconds = TimeInterval(value) {
                     result.r3ProbeDuration = seconds
@@ -65,6 +68,7 @@ struct Arguments {
                   treadmill-trace [--output path] [--scan-seconds 12] [--probe]
                   treadmill-trace time-probe [--output path] [--scan-seconds 12]
                   treadmill-trace vitalwalk-probe [--output path] [--scan-seconds 12]
+                  treadmill-trace apollo-resume-probe [--output path] [--scan-seconds 12]
                   treadmill-trace r3-probe [--duration 30] [--output path] [--scan-seconds 12]
                   treadmill-trace r3-probe --control-tests --i-understand-this-may-move-the-belt
 
@@ -83,6 +87,10 @@ struct Arguments {
                 speed units, native increments, pause, resume, incline, and steps.
                 It requires runtime confirmation because it moves the belt.
 
+                apollo-resume-probe tests restoring a saved Apollo speed only after
+                Start produces movement. It stays within one native increment of
+                minimum speed and requires the same runtime safety confirmation.
+
                 r3-probe runs a WalkingPad R3 diagnostic. Safe mode sends FTMS
                 Request Control and known KingSmith supplement init/query commands,
                 but does not start the belt or change speed. Control tests require
@@ -94,9 +102,15 @@ struct Arguments {
             }
         }
 
-        let requestedModes = [requestedR3Probe, requestedInteractiveProbe, requestedTimeProbe, requestedVitalwalkProbe].filter { $0 }.count
+        let requestedModes = [
+            requestedR3Probe,
+            requestedInteractiveProbe,
+            requestedTimeProbe,
+            requestedVitalwalkProbe,
+            requestedApolloResumeProbe,
+        ].filter { $0 }.count
         if requestedModes > 1 {
-            fputs("r3-probe, time-probe, vitalwalk-probe, and --probe cannot be combined\n", stderr)
+            fputs("r3-probe, time-probe, vitalwalk-probe, apollo-resume-probe, and --probe cannot be combined\n", stderr)
             exit(2)
         }
         if !requestedR3Probe, result.r3ControlTests {
@@ -116,6 +130,8 @@ struct Arguments {
             result.mode = .timeProbe
         } else if requestedVitalwalkProbe {
             result.mode = .vitalwalkProbe
+        } else if requestedApolloResumeProbe {
+            result.mode = .apolloResumeProbe
         }
 
         return result
@@ -127,6 +143,7 @@ enum CaptureMode {
     case interactiveProbe
     case timeProbe
     case vitalwalkProbe
+    case apolloResumeProbe
     case r3Probe(duration: TimeInterval, controlTests: Bool)
 }
 
@@ -167,6 +184,7 @@ final class BLECapture: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
     private var totalTreadmillDataPackets = 0
     private var r3ProbeState = R3ProbeState()
     private var vitalwalkProbeState = VitalwalkProbeState()
+    private var apolloResumeProbeState = ApolloResumeProbeState()
     private var vitalwalkMovementPossible = false
     private var vitalwalkExitCode: Int32 = 0
     private var sawNonzeroSpeed = false
@@ -238,6 +256,18 @@ final class BLECapture: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
         var abortedReason: String?
     }
 
+    private struct ApolloResumeProbeState {
+        var displayUnit: VitalwalkDisplayUnit?
+        var targets: VitalwalkProbeTargets?
+        var commandResults: [[String: Any]] = []
+        var prePauseDisplay: Double?
+        var restartDisplay: Double?
+        var restoredDisplay: Double?
+        var retryDisplay: Double?
+        var movementObserved = false
+        var abortedReason: String?
+    }
+
     private struct R3ProbeState {
         var discoveredServices: Set<String> = []
         var discoveredCharacteristics: [String: [String]] = [:]
@@ -292,7 +322,15 @@ final class BLECapture: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
         case .interactiveProbe: "interactiveProbe"
         case .timeProbe: "timeProbe"
         case .vitalwalkProbe: "vitalwalkProbe"
+        case .apolloResumeProbe: "apolloResumeProbe"
         case let .r3Probe(_, controlTests): controlTests ? "r3ProbeControlTests" : "r3Probe"
+        }
+    }
+
+    private var isVitalwalkControlProbe: Bool {
+        switch mode {
+        case .vitalwalkProbe, .apolloResumeProbe: true
+        case .guidedCapture, .interactiveProbe, .timeProbe, .r3Probe: false
         }
     }
 
@@ -386,7 +424,7 @@ final class BLECapture: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
             "error": error?.localizedDescription ?? "none",
         ])
         print("Disconnected. Log saved to \(logger.path)")
-        if case .vitalwalkProbe = mode {
+        if isVitalwalkControlProbe {
             finish(vitalwalkExitCode)
         }
         finish(0)
@@ -802,6 +840,8 @@ final class BLECapture: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
                 self.startTimeProbe()
             case .vitalwalkProbe:
                 self.startVitalwalkProbe()
+            case .apolloResumeProbe:
+                self.startApolloResumeProbe()
             case let .r3Probe(duration, controlTests):
                 self.startR3Probe(duration: duration, controlTests: controlTests)
             }
@@ -1052,6 +1092,414 @@ final class BLECapture: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
         finishVitalwalkProbe()
     }
 
+    private func startApolloResumeProbe() {
+        discoveryTimeout?.invalidate()
+        print("")
+        print("Apollo resume-speed diagnostic")
+        print("This probe tests restoring one saved speed target after Start produces movement.")
+        print("The belt stays at the reported minimum speed or one native increment above it.")
+        print("")
+
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            self?.runApolloResumeProbe()
+        }
+    }
+
+    private func runApolloResumeProbe() {
+        guard waitForVitalwalkPrerequisites() else {
+            abortApolloResumeProbe(reason: "prerequisites_unavailable", attemptStop: false)
+            return
+        }
+        guard let speedRange, let targets = VitalwalkProbeTargets.make(from: speedRange) else {
+            abortApolloResumeProbe(reason: "invalid_speed_range", attemptStop: false)
+            return
+        }
+        guard let unit = promptVitalwalkDisplayUnit() else {
+            abortApolloResumeProbe(reason: "input_closed", attemptStop: false)
+            return
+        }
+        apolloResumeProbeState.targets = targets
+        apolloResumeProbeState.displayUnit = unit
+        logger.write("apollo_resume_probe.context", [
+            "displayUnit": unit.rawValue,
+            "minimumRaw": targets.minimumRaw,
+            "incrementRaw": targets.incrementRaw,
+            "savedTargetRaw": targets.incrementedRaw,
+            "speedRangeMaximumRaw": speedRange.maximumKmh,
+        ])
+
+        print("")
+        print("SAFETY CHECK")
+        print("Stand off the belt, keep the physical stop control reachable, and keep the treadmill clear.")
+        print("The probe attempts FTMS Stop on failure, interruption, and normal completion.")
+        print("Type RUN APOLLO RESUME PROBE exactly to continue:")
+        guard readLine()?.trimmingCharacters(in: .whitespacesAndNewlines) == "RUN APOLLO RESUME PROBE" else {
+            abortApolloResumeProbe(reason: "runtime_confirmation_declined", attemptStop: false)
+            return
+        }
+
+        guard requireApolloResumeCommand(
+            name: "request_control",
+            payload: FTMSCommand.requestControl.payload,
+            opcode: FTMSCommand.requestControl.requestOpcode
+        ) else {
+            abortApolloResumeProbe(reason: "request_control_failed", attemptStop: false)
+            return
+        }
+        guard requireApolloResumeCommand(
+            name: "initial_stop",
+            payload: FTMSCommand.stop.payload,
+            opcode: FTMSCommand.stop.requestOpcode
+        ) else {
+            abortApolloResumeProbe(reason: "initial_stop_failed", attemptStop: true)
+            return
+        }
+        let initiallyStopped = waitForVitalwalkBeltToStop(timeout: 12)
+        guard confirmVitalwalkBeltStoppedIfNeeded(
+            telemetryStopped: initiallyStopped,
+            context: "before the initial Start"
+        ) else {
+            abortApolloResumeProbe(reason: "initial_physical_stop_not_confirmed", attemptStop: true)
+            return
+        }
+        guard waitForApolloEndToClear(context: "initial_start") else {
+            abortApolloResumeProbe(reason: "initial_end_clear_not_confirmed", attemptStop: true)
+            return
+        }
+
+        vitalwalkMovementPossible = true
+        guard requireApolloResumeCommand(
+            name: "initial_start",
+            payload: FTMSCommand.start.payload,
+            opcode: FTMSCommand.start.requestOpcode
+        ) else {
+            abortApolloResumeProbe(reason: "initial_start_failed", attemptStop: true)
+            return
+        }
+        guard waitForVitalwalkBeltToMove(timeout: 12, phase: "initial_start") else {
+            abortApolloResumeProbe(reason: "initial_movement_not_observed", attemptStop: true)
+            return
+        }
+
+        guard let savedTargetCommand = FTMSCommand.speed(
+            requestedKmh: targets.incrementedRaw,
+            range: speedRange
+        ), requireApolloResumeCommand(
+            name: "establish_saved_speed",
+            payload: savedTargetCommand.payload,
+            opcode: savedTargetCommand.requestOpcode,
+            fields: ["savedTargetRaw": targets.incrementedRaw]
+        ) else {
+            abortApolloResumeProbe(reason: "saved_speed_command_failed", attemptStop: true)
+            return
+        }
+        print("Waiting 6 seconds for the saved speed to stabilize...")
+        Thread.sleep(forTimeInterval: 6)
+        guard let prePauseDisplay = promptRequiredDouble(
+            "Enter the exact speed shown before Pause (number only):"
+        ) else {
+            abortApolloResumeProbe(reason: "pre_pause_display_missing", attemptStop: true)
+            return
+        }
+        apolloResumeProbeState.prePauseDisplay = prePauseDisplay
+        logger.write("apollo_resume_probe.pre_pause", [
+            "savedTargetRaw": targets.incrementedRaw,
+            "physicalDisplayValue": prePauseDisplay,
+            "matchesSavedTarget": apolloDisplayMatches(
+                prePauseDisplay,
+                targetRaw: targets.incrementedRaw,
+                unit: unit
+            ),
+            "snapshot": vitalwalkSnapshot(),
+        ])
+        guard apolloDisplayMatches(prePauseDisplay, targetRaw: targets.incrementedRaw, unit: unit) else {
+            abortApolloResumeProbe(reason: "saved_speed_not_established", attemptStop: true)
+            return
+        }
+
+        guard requireApolloResumeCommand(
+            name: "pause_stop",
+            payload: FTMSCommand.stop.payload,
+            opcode: FTMSCommand.stop.requestOpcode
+        ) else {
+            abortApolloResumeProbe(reason: "pause_stop_failed", attemptStop: true)
+            return
+        }
+        let stoppedForResume = waitForVitalwalkBeltToStop(timeout: 12)
+        guard confirmVitalwalkBeltStoppedIfNeeded(
+            telemetryStopped: stoppedForResume,
+            context: "before the resume sequence"
+        ) else {
+            abortApolloResumeProbe(reason: "resume_physical_stop_not_confirmed", attemptStop: true)
+            return
+        }
+        guard waitForApolloEndToClear(context: "resume") else {
+            abortApolloResumeProbe(reason: "resume_end_clear_not_confirmed", attemptStop: true)
+            return
+        }
+
+        guard requireApolloResumeCommand(
+            name: "resume_start",
+            payload: FTMSCommand.start.payload,
+            opcode: FTMSCommand.start.requestOpcode
+        ) else {
+            abortApolloResumeProbe(reason: "resume_start_failed", attemptStop: true)
+            return
+        }
+        guard waitForVitalwalkBeltToMove(timeout: 12, phase: "resume_start") else {
+            abortApolloResumeProbe(reason: "resume_movement_not_observed", attemptStop: true)
+            return
+        }
+        apolloResumeProbeState.movementObserved = true
+
+        guard let restartDisplay = promptRequiredDouble(
+            "Before speed restoration, enter the exact speed now shown (number only):"
+        ) else {
+            abortApolloResumeProbe(reason: "restart_display_missing", attemptStop: true)
+            return
+        }
+        apolloResumeProbeState.restartDisplay = restartDisplay
+        logger.write("apollo_resume_probe.movement_confirmed", [
+            "physicalDisplayValue": restartDisplay,
+            "snapshot": vitalwalkSnapshot(),
+        ])
+
+        guard requireApolloResumeCommand(
+            name: "restore_speed_after_movement",
+            payload: savedTargetCommand.payload,
+            opcode: savedTargetCommand.requestOpcode,
+            fields: ["savedTargetRaw": targets.incrementedRaw]
+        ) else {
+            abortApolloResumeProbe(reason: "post_movement_restore_failed", attemptStop: true)
+            return
+        }
+        print("Waiting 6 seconds for the restored speed...")
+        Thread.sleep(forTimeInterval: 6)
+        guard let restoredDisplay = promptRequiredDouble(
+            "Enter the exact speed shown after restoration (number only):"
+        ) else {
+            abortApolloResumeProbe(reason: "restored_display_missing", attemptStop: true)
+            return
+        }
+        apolloResumeProbeState.restoredDisplay = restoredDisplay
+        var restored = apolloDisplayMatches(
+            restoredDisplay,
+            targetRaw: targets.incrementedRaw,
+            unit: unit
+        )
+        logger.write("apollo_resume_probe.restore_observation", [
+            "attempt": 1,
+            "physicalDisplayValue": restoredDisplay,
+            "savedTargetRaw": targets.incrementedRaw,
+            "restored": restored,
+            "snapshot": vitalwalkSnapshot(),
+        ])
+
+        if !restored {
+            print("The first post-movement command did not restore the saved speed.")
+            print("Waiting 5 seconds, then sending the same safe target once more...")
+            Thread.sleep(forTimeInterval: 5)
+            guard requireApolloResumeCommand(
+                name: "restore_speed_delayed_retry",
+                payload: savedTargetCommand.payload,
+                opcode: savedTargetCommand.requestOpcode,
+                fields: ["savedTargetRaw": targets.incrementedRaw]
+            ) else {
+                abortApolloResumeProbe(reason: "delayed_restore_failed", attemptStop: true)
+                return
+            }
+            Thread.sleep(forTimeInterval: 6)
+            guard let retryDisplay = promptRequiredDouble(
+                "Enter the exact speed shown after the delayed retry (number only):"
+            ) else {
+                abortApolloResumeProbe(reason: "retry_display_missing", attemptStop: true)
+                return
+            }
+            apolloResumeProbeState.retryDisplay = retryDisplay
+            restored = apolloDisplayMatches(
+                retryDisplay,
+                targetRaw: targets.incrementedRaw,
+                unit: unit
+            )
+            logger.write("apollo_resume_probe.restore_observation", [
+                "attempt": 2,
+                "physicalDisplayValue": retryDisplay,
+                "savedTargetRaw": targets.incrementedRaw,
+                "restored": restored,
+                "snapshot": vitalwalkSnapshot(),
+            ])
+        }
+
+        guard requireApolloResumeCommand(
+            name: "final_stop",
+            payload: FTMSCommand.stop.payload,
+            opcode: FTMSCommand.stop.requestOpcode
+        ) else {
+            abortApolloResumeProbe(reason: "final_stop_failed", attemptStop: true)
+            return
+        }
+        let stoppedAtCompletion = waitForVitalwalkBeltToStop(timeout: 12)
+        guard confirmVitalwalkBeltStoppedIfNeeded(
+            telemetryStopped: stoppedAtCompletion,
+            context: "before the probe exits"
+        ) else {
+            abortApolloResumeProbe(reason: "final_physical_stop_not_confirmed", attemptStop: true)
+            return
+        }
+        vitalwalkMovementPossible = false
+        finishApolloResumeProbe(restored: restored)
+    }
+
+    private func requireApolloResumeCommand(
+        name: String,
+        payload: Data,
+        opcode: UInt8,
+        fields: [String: Any] = [:]
+    ) -> Bool {
+        let result = sendVitalwalkCommand(
+            name: name,
+            payload: payload,
+            opcode: opcode,
+            fields: fields,
+            eventPrefix: "apollo_resume_probe"
+        )
+        apolloResumeProbeState.commandResults.append(result.dictionary)
+        logger.write(
+            "apollo_resume_probe.command_result",
+            result.dictionary.merging(fields) { current, _ in current }
+        )
+        if !result.succeeded {
+            print("Command \(name) failed or timed out. The probe will stop safely.")
+        }
+        return result.succeeded
+    }
+
+    private func waitForApolloEndToClear(context: String) -> Bool {
+        let startedAt = Date()
+        print("")
+        print("Wait until the END message has completely cleared from the treadmill display.")
+        print("Type READY only after the normal idle display is visible:")
+        let confirmed = readLine()?.trimmingCharacters(in: .whitespacesAndNewlines) == "READY"
+        logger.write("apollo_resume_probe.end_clear", [
+            "context": context,
+            "confirmed": confirmed,
+            "waitSeconds": Date().timeIntervalSince(startedAt),
+            "snapshot": vitalwalkSnapshot(),
+        ])
+        return confirmed
+    }
+
+    private func waitForVitalwalkBeltToMove(timeout: TimeInterval, phase: String) -> Bool {
+        let startedAt = Date()
+        let deadline = startedAt.addingTimeInterval(timeout)
+        while Date() < deadline {
+            let speed = DispatchQueue.main.sync { latestStatus.speedKmh }
+            if let speed, speed > 0 {
+                logger.write("apollo_resume_probe.movement", [
+                    "phase": phase,
+                    "observed": true,
+                    "waitSeconds": Date().timeIntervalSince(startedAt),
+                    "speedKmh": speed,
+                    "snapshot": vitalwalkSnapshot(),
+                ])
+                return true
+            }
+            Thread.sleep(forTimeInterval: 0.1)
+        }
+        logger.write("apollo_resume_probe.movement", [
+            "phase": phase,
+            "observed": false,
+            "waitSeconds": Date().timeIntervalSince(startedAt),
+            "snapshot": vitalwalkSnapshot(),
+        ])
+        return false
+    }
+
+    private func apolloDisplayMatches(
+        _ displayValue: Double,
+        targetRaw: Double,
+        unit: VitalwalkDisplayUnit
+    ) -> Bool {
+        VitalwalkSpeedSample(
+            rawTarget: targetRaw,
+            reportedSpeedKmh: nil,
+            physicalDisplayValue: displayValue,
+            physicalDisplayUnit: unit
+        ).rawMatchesPhysicalDisplay
+    }
+
+    private func abortApolloResumeProbe(reason: String, attemptStop: Bool) {
+        vitalwalkExitCode = 1
+        apolloResumeProbeState.abortedReason = reason
+        logger.write("apollo_resume_probe.aborted", [
+            "reason": reason,
+            "attemptStop": attemptStop,
+            "snapshot": vitalwalkSnapshot(),
+        ])
+        if attemptStop {
+            let result = sendVitalwalkCommand(
+                name: "emergency_stop",
+                payload: FTMSCommand.stop.payload,
+                opcode: FTMSCommand.stop.requestOpcode,
+                eventPrefix: "apollo_resume_probe",
+                timeout: 3
+            )
+            apolloResumeProbeState.commandResults.append(result.dictionary)
+            logger.write("apollo_resume_probe.command_result", result.dictionary)
+            let stopped = waitForVitalwalkBeltToStop(timeout: 8)
+            _ = confirmVitalwalkBeltStoppedIfNeeded(
+                telemetryStopped: stopped,
+                context: "before the probe exits"
+            )
+        }
+        vitalwalkMovementPossible = false
+        finishApolloResumeProbe(restored: false)
+    }
+
+    private func finishApolloResumeProbe(restored: Bool) {
+        let summary: [String: Any] = [
+            "completed": apolloResumeProbeState.abortedReason == nil,
+            "abortedReason": apolloResumeProbeState.abortedReason ?? NSNull(),
+            "displayUnit": apolloResumeProbeState.displayUnit?.rawValue ?? "unknown",
+            "targets": apolloResumeProbeState.targets.map {
+                [
+                    "minimumRaw": $0.minimumRaw,
+                    "incrementRaw": $0.incrementRaw,
+                    "savedTargetRaw": $0.incrementedRaw,
+                ]
+            } ?? NSNull(),
+            "movementObserved": apolloResumeProbeState.movementObserved,
+            "prePauseDisplay": apolloResumeProbeState.prePauseDisplay ?? NSNull(),
+            "restartDisplay": apolloResumeProbeState.restartDisplay ?? NSNull(),
+            "restoredDisplay": apolloResumeProbeState.restoredDisplay ?? NSNull(),
+            "retryDisplay": apolloResumeProbeState.retryDisplay ?? NSNull(),
+            "restored": restored,
+            "commandResults": apolloResumeProbeState.commandResults,
+            "finalSnapshot": vitalwalkSnapshot(),
+        ]
+        logger.write("apollo_resume_probe.summary", summary)
+
+        print("")
+        print("===== Apollo Resume Probe Report =====")
+        print("Completed: \(apolloResumeProbeState.abortedReason == nil ? "yes" : "no")")
+        if let reason = apolloResumeProbeState.abortedReason {
+            print("Stopped because: \(reason)")
+        }
+        print("Saved speed restored after movement: \(restored ? "yes" : "no")")
+        print("Log file: \(logger.path)")
+        print("Send this JSONL file with the issue report.")
+        print("======================================")
+
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            if let selected {
+                central.cancelPeripheralConnection(selected)
+            } else {
+                finish(apolloResumeProbeState.abortedReason == nil ? 0 : 1)
+            }
+        }
+    }
+
     private func waitForVitalwalkPrerequisites() -> Bool {
         for attempt in 1 ... 6 {
             var missing: [String] = []
@@ -1204,6 +1652,7 @@ final class BLECapture: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
         payload: Data,
         opcode: UInt8,
         fields: [String: Any] = [:],
+        eventPrefix: String = "vitalwalk_probe",
         timeout: TimeInterval = 5
     ) -> VitalwalkCommandResult {
         var responseStart = 0
@@ -1212,7 +1661,7 @@ final class BLECapture: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
             responseStart = r3ProbeState.controlPointResponses.count
             guard let selected, let controlPointCharacteristic else { return }
             canSend = true
-            logger.write("vitalwalk_probe.tx", [
+            logger.write("\(eventPrefix).tx", [
                 "name": name,
                 "requestOpcode": String(format: "0x%02X", opcode),
                 "hex": payload.hexString,
@@ -1844,7 +2293,7 @@ final class BLECapture: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
             source.setEventHandler { [weak self] in
                 guard let self else { exit(1) }
                 print("\nInterrupted. Closing log...")
-                if self.vitalwalkMovementPossible, case .vitalwalkProbe = self.mode {
+                if self.vitalwalkMovementPossible, self.isVitalwalkControlProbe {
                     self.attemptVitalwalkEmergencyStopFromMain(reason: "signal_\(signalNumber)")
                     Timer.scheduledTimer(withTimeInterval: 1.0, repeats: false) { [weak self] _ in
                         guard let self else { exit(1) }

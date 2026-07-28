@@ -80,6 +80,26 @@ The diagnostic requires zero-speed telemetry or an exact physical `STOPPED`
 confirmation before a resume test and before normal exit. Send the generated
 `treadmill-trace-*.jsonl` file with the issue report.
 
+## Apollo resume diagnostic
+
+Use this focused diagnostic to test restoring the saved speed after an Apollo
+Stop-based Pause:
+
+```sh
+.build/release/TreadmillTrace apollo-resume-probe
+```
+
+The probe establishes a saved target one native increment above minimum speed,
+stops the belt, and waits for the physical `END` message to clear. It then sends
+Start, waits for nonzero speed telemetry, and restores the saved target. If the
+first post-movement speed command has no effect, it sends the same safe target
+once more after a delay.
+
+The belt stays at the reported minimum or one native increment above it. Stand
+off the belt and keep the physical stop control within reach. The generated
+JSONL records command responses, movement timing, display observations, and both
+restoration attempts.
+
 ## Probe mode
 
 ```sh
