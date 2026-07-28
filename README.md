@@ -100,6 +100,31 @@ off the belt and keep the physical stop control within reach. The generated
 JSONL records command responses, movement timing, display observations, and both
 restoration attempts.
 
+## TT6F release diagnostic
+
+Use this focused probe to verify WalkingMate's generic FTMS behavior on a
+Techo-Train TT6F before releasing an app update:
+
+```sh
+.build/release/TreadmillTrace tt6f-probe --output ~/Desktop/tt6f.jsonl
+```
+
+This mode deliberately does not subscribe to FITSHOW `FFF1`. It records idle
+FTMS telemetry, requests control once, then measures telemetry again with
+WalkingMate's two-second Request Control heartbeat. It sends Start followed by a
+standard km/h target at the treadmill's reported minimum speed while keeping the
+heartbeat active. If that sequence does not move the belt, it safely stops and
+tries the minimum-speed target before Start without heartbeats. A moving belt is
+also tested with WalkingMate's exact 3.0 km/h default when the treadmill supports
+it. The probe records physical movement, the displayed speed and unit, and FTMS
+telemetry before sending Stop. Stand off the belt and keep the physical stop
+control within reach. Any command failure or interruption triggers an FTMS Stop
+attempt.
+
+Send the generated JSONL file with the issue report. A successful run confirms
+whether the proposed WalkingMate path can both start the belt and retain
+tracking without distributing a WalkingMate build.
+
 ## Probe mode
 
 ```sh

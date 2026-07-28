@@ -33,6 +33,7 @@ struct Arguments {
         var requestedTimeProbe = false
         var requestedVitalwalkProbe = false
         var requestedApolloResumeProbe = false
+        var requestedTT6FProbe = false
 
         while let arg = iterator.next() {
             switch arg {
@@ -44,6 +45,8 @@ struct Arguments {
                 requestedVitalwalkProbe = true
             case "apollo-resume-probe":
                 requestedApolloResumeProbe = true
+            case "tt6f-probe":
+                requestedTT6FProbe = true
             case "--duration":
                 if let value = iterator.next(), let seconds = TimeInterval(value) {
                     result.r3ProbeDuration = seconds
@@ -69,6 +72,7 @@ struct Arguments {
                   treadmill-trace time-probe [--output path] [--scan-seconds 12]
                   treadmill-trace vitalwalk-probe [--output path] [--scan-seconds 12]
                   treadmill-trace apollo-resume-probe [--output path] [--scan-seconds 12]
+                  treadmill-trace tt6f-probe [--output path] [--scan-seconds 12]
                   treadmill-trace r3-probe [--duration 30] [--output path] [--scan-seconds 12]
                   treadmill-trace r3-probe --control-tests --i-understand-this-may-move-the-belt
 
@@ -91,6 +95,10 @@ struct Arguments {
                 Start produces movement. It stays within one native increment of
                 minimum speed and requires the same runtime safety confirmation.
 
+                tt6f-probe reproduces WalkingMate's generic FTMS start path without
+                subscribing to FITSHOW notifications. It uses the reported minimum
+                speed and requires runtime confirmation because it moves the belt.
+
                 r3-probe runs a WalkingPad R3 diagnostic. Safe mode sends FTMS
                 Request Control and known KingSmith supplement init/query commands,
                 but does not start the belt or change speed. Control tests require
@@ -108,9 +116,10 @@ struct Arguments {
             requestedTimeProbe,
             requestedVitalwalkProbe,
             requestedApolloResumeProbe,
+            requestedTT6FProbe,
         ].filter { $0 }.count
         if requestedModes > 1 {
-            fputs("r3-probe, time-probe, vitalwalk-probe, apollo-resume-probe, and --probe cannot be combined\n", stderr)
+            fputs("probe modes cannot be combined\n", stderr)
             exit(2)
         }
         if !requestedR3Probe, result.r3ControlTests {
@@ -132,6 +141,8 @@ struct Arguments {
             result.mode = .vitalwalkProbe
         } else if requestedApolloResumeProbe {
             result.mode = .apolloResumeProbe
+        } else if requestedTT6FProbe {
+            result.mode = .tt6fProbe
         }
 
         return result
@@ -144,6 +155,7 @@ enum CaptureMode {
     case timeProbe
     case vitalwalkProbe
     case apolloResumeProbe
+    case tt6fProbe
     case r3Probe(duration: TimeInterval, controlTests: Bool)
 }
 
@@ -185,6 +197,7 @@ final class BLECapture: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
     private var r3ProbeState = R3ProbeState()
     private var vitalwalkProbeState = VitalwalkProbeState()
     private var apolloResumeProbeState = ApolloResumeProbeState()
+    private var tt6fProbeState = TT6FProbeState()
     private var vitalwalkMovementPossible = false
     private var vitalwalkExitCode: Int32 = 0
     private var sawNonzeroSpeed = false
@@ -268,6 +281,29 @@ final class BLECapture: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
         var abortedReason: String?
     }
 
+    private enum TT6FCommandOrder: Equatable {
+        case startThenSpeed
+        case speedThenStart
+    }
+
+    private enum TT6FMovementAttemptResult {
+        case observed(Bool)
+        case failed(String)
+    }
+
+    private struct TT6FProbeState {
+        var commandResults: [[String: Any]] = []
+        var packetsBeforeControl = 0
+        var packetsAfterControl = 0
+        var packetsWithHeartbeat = 0
+        var packetsAfterStart = 0
+        var movementObserved = false
+        var physicalMovementObserved: Bool?
+        var movementAttempts: [[String: Any]] = []
+        var displayObservation: String?
+        var abortedReason: String?
+    }
+
     private struct R3ProbeState {
         var discoveredServices: Set<String> = []
         var discoveredCharacteristics: [String: [String]] = [:]
@@ -323,13 +359,14 @@ final class BLECapture: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
         case .timeProbe: "timeProbe"
         case .vitalwalkProbe: "vitalwalkProbe"
         case .apolloResumeProbe: "apolloResumeProbe"
+        case .tt6fProbe: "tt6fProbe"
         case let .r3Probe(_, controlTests): controlTests ? "r3ProbeControlTests" : "r3Probe"
         }
     }
 
     private var isVitalwalkControlProbe: Bool {
         switch mode {
-        case .vitalwalkProbe, .apolloResumeProbe: true
+        case .vitalwalkProbe, .apolloResumeProbe, .tt6fProbe: true
         case .guidedCapture, .interactiveProbe, .timeProbe, .r3Probe: false
         }
     }
@@ -495,7 +532,7 @@ final class BLECapture: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
                 controlPointCharacteristic = characteristic
             }
 
-            if characteristic.properties.contains(.notify) || characteristic.properties.contains(.indicate) {
+            if shouldEnableNotifications(for: characteristic) {
                 pendingNotifyEnables.insert(characteristicKey(characteristic))
                 peripheral.setNotifyValue(true, for: characteristic)
             }
@@ -507,6 +544,14 @@ final class BLECapture: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
                 peripheral.readValue(for: characteristic)
             }
         }
+    }
+
+    private func shouldEnableNotifications(for characteristic: CBCharacteristic) -> Bool {
+        guard characteristic.properties.contains(.notify) || characteristic.properties.contains(.indicate) else {
+            return false
+        }
+        guard case .tt6fProbe = mode else { return true }
+        return characteristic.service?.uuid == CBUUID(string: "1826")
     }
 
     func peripheral(_: CBPeripheral, didUpdateNotificationStateFor characteristic: CBCharacteristic, error: Error?) {
@@ -842,8 +887,370 @@ final class BLECapture: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
                 self.startVitalwalkProbe()
             case .apolloResumeProbe:
                 self.startApolloResumeProbe()
+            case .tt6fProbe:
+                self.startTT6FProbe()
             case let .r3Probe(duration, controlTests):
                 self.startR3Probe(duration: duration, controlTests: controlTests)
+            }
+        }
+    }
+
+    private func startTT6FProbe() {
+        discoveryTimeout?.invalidate()
+        print("")
+        print("TT6F generic FTMS diagnostic")
+        print("This probe avoids FITSHOW notifications and reproduces WalkingMate's proposed control path.")
+        print("The belt will run only at the minimum speed reported by the treadmill.")
+        print("")
+
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            self?.runTT6FProbe()
+        }
+    }
+
+    private func runTT6FProbe() {
+        guard waitForVitalwalkPrerequisites() else {
+            abortTT6FProbe(reason: "prerequisites_unavailable", attemptStop: false)
+            return
+        }
+        guard let speedRange,
+              let speedCommand = FTMSCommand.speed(requestedKmh: speedRange.minimumKmh, range: speedRange)
+        else {
+            abortTT6FProbe(reason: "invalid_speed_range", attemptStop: false)
+            return
+        }
+
+        let fitshowNotifying = DispatchQueue.main.sync {
+            notifiedCharacteristics.contains { $0.hasPrefix("FFF0/") }
+        }
+        logger.write("tt6f_probe.context", [
+            "fitshowServicePresent": selectedServices.contains(CBUUID(string: "FFF0")),
+            "fitshowNotificationsEnabled": fitshowNotifying,
+            "minimumKmh": speedCommand.target ?? speedRange.minimumKmh,
+            "speedPayload": speedCommand.payload.hexString,
+        ])
+        guard !fitshowNotifying else {
+            abortTT6FProbe(reason: "fitshow_notifications_enabled", attemptStop: false)
+            return
+        }
+
+        print("Recording idle FTMS telemetry for 5 seconds...")
+        let idleStart = DispatchQueue.main.sync { totalTreadmillDataPackets }
+        Thread.sleep(forTimeInterval: 5)
+        tt6fProbeState.packetsBeforeControl = DispatchQueue.main.sync {
+            totalTreadmillDataPackets - idleStart
+        }
+
+        print("")
+        print("SAFETY CHECK")
+        print("Stand off the belt, keep the physical stop control reachable, and keep the treadmill clear.")
+        print("The probe attempts FTMS Stop on failure, interruption, and normal completion.")
+        print("Type RUN TT6F PROBE exactly to continue:")
+        guard readLine()?.trimmingCharacters(in: .whitespacesAndNewlines) == "RUN TT6F PROBE" else {
+            abortTT6FProbe(reason: "runtime_confirmation_declined", attemptStop: false)
+            return
+        }
+
+        guard requireTT6FCommand(
+            name: "request_control",
+            payload: FTMSCommand.requestControl.payload,
+            opcode: FTMSCommand.requestControl.requestOpcode
+        ) else {
+            abortTT6FProbe(reason: "request_control_failed", attemptStop: false)
+            return
+        }
+
+        let controlledStart = DispatchQueue.main.sync { totalTreadmillDataPackets }
+        print("Recording telemetry for 5 seconds after Request Control...")
+        Thread.sleep(forTimeInterval: 5)
+        tt6fProbeState.packetsAfterControl = DispatchQueue.main.sync {
+            totalTreadmillDataPackets - controlledStart
+        }
+
+        let heartbeatStart = DispatchQueue.main.sync { totalTreadmillDataPackets }
+        print("Recording telemetry with WalkingMate's 2-second control heartbeat...")
+        for heartbeat in 1 ... 2 {
+            Thread.sleep(forTimeInterval: 2)
+            guard requireTT6FCommand(
+                name: "request_control_heartbeat_\(heartbeat)",
+                payload: FTMSCommand.requestControl.payload,
+                opcode: FTMSCommand.requestControl.requestOpcode
+            ) else {
+                abortTT6FProbe(reason: "control_heartbeat_failed", attemptStop: false)
+                return
+            }
+        }
+        tt6fProbeState.packetsWithHeartbeat = DispatchQueue.main.sync {
+            totalTreadmillDataPackets - heartbeatStart
+        }
+
+        vitalwalkMovementPossible = true
+        let primaryResult = runTT6FMovementAttempt(
+            name: "walkingmate_order_with_heartbeat",
+            speedCommand: speedCommand,
+            order: .startThenSpeed,
+            heartbeat: true
+        )
+        let physicalMovement: Bool
+        switch primaryResult {
+        case let .observed(moved):
+            physicalMovement = moved
+        case let .failed(reason):
+            abortTT6FProbe(reason: reason, attemptStop: true)
+            return
+        }
+
+        if physicalMovement {
+            if let defaultCommand = FTMSCommand.speed(requestedKmh: 3, range: speedRange),
+               defaultCommand.target == 3
+            {
+                guard requireTT6FCommand(
+                    name: "set_speed_walkingmate_default_kmh",
+                    payload: defaultCommand.payload,
+                    opcode: defaultCommand.requestOpcode,
+                    fields: [
+                        "requestedKmh": 3,
+                        "targetKmh": 3,
+                        "expectedPayload": "02 2C 01",
+                    ]
+                ) else {
+                    abortTT6FProbe(reason: "default_speed_target_failed", attemptStop: true)
+                    return
+                }
+                print("Waiting 6 seconds at WalkingMate's 3.0 km/h default...")
+                Thread.sleep(forTimeInterval: 6)
+            }
+            tt6fProbeState.displayObservation = promptRequiredText(
+                "Enter the displayed speed and unit exactly as shown, or enter unknown:"
+            )
+        } else {
+            guard stopTT6FAttempt(context: "before the fallback control order") else {
+                abortTT6FProbe(reason: "primary_attempt_stop_failed", attemptStop: true)
+                return
+            }
+            guard requireTT6FCommand(
+                name: "fallback_request_control",
+                payload: FTMSCommand.requestControl.payload,
+                opcode: FTMSCommand.requestControl.requestOpcode
+            ) else {
+                abortTT6FProbe(reason: "fallback_request_control_failed", attemptStop: false)
+                return
+            }
+
+            let fallbackResult = runTT6FMovementAttempt(
+                name: "speed_before_start_without_heartbeat",
+                speedCommand: speedCommand,
+                order: .speedThenStart,
+                heartbeat: false
+            )
+            switch fallbackResult {
+            case let .observed(moved):
+                tt6fProbeState.physicalMovementObserved = moved
+                if moved {
+                    tt6fProbeState.displayObservation = promptRequiredText(
+                        "Enter the displayed speed and unit exactly as shown, or enter unknown:"
+                    )
+                }
+            case let .failed(reason):
+                abortTT6FProbe(reason: reason, attemptStop: true)
+                return
+            }
+        }
+
+        guard stopTT6FAttempt(context: "before the TT6F probe exits") else {
+            abortTT6FProbe(reason: "final_stop_failed", attemptStop: true)
+            return
+        }
+
+        vitalwalkMovementPossible = false
+        finishTT6FProbe()
+    }
+
+    private func runTT6FMovementAttempt(
+        name: String,
+        speedCommand: FTMSCommand,
+        order: TT6FCommandOrder,
+        heartbeat: Bool
+    ) -> TT6FMovementAttemptResult {
+        let commands: [(String, FTMSCommand)] = switch order {
+        case .startThenSpeed:
+            [("start", .start), ("set_speed_minimum_kmh", speedCommand)]
+        case .speedThenStart:
+            [("set_speed_minimum_kmh", speedCommand), ("start", .start)]
+        }
+        for (commandName, command) in commands {
+            guard requireTT6FCommand(
+                name: "\(name)_\(commandName)",
+                payload: command.payload,
+                opcode: command.requestOpcode,
+                fields: command.target.map { ["targetKmh": $0] } ?? [:]
+            ) else {
+                return .failed("\(name)_\(commandName)_failed")
+            }
+        }
+
+        let movementStart = DispatchQueue.main.sync { totalTreadmillDataPackets }
+        let deadline = Date().addingTimeInterval(10)
+        var nextHeartbeat = Date().addingTimeInterval(2)
+        var heartbeatNumber = 0
+        var telemetryMovement = false
+        print("Waiting up to 10 seconds for \(name)...")
+        while Date() < deadline {
+            if DispatchQueue.main.sync(execute: { (latestStatus.speedKmh ?? 0) > 0 }) {
+                telemetryMovement = true
+            }
+            if heartbeat, Date() >= nextHeartbeat {
+                heartbeatNumber += 1
+                guard requireTT6FCommand(
+                    name: "\(name)_control_heartbeat_\(heartbeatNumber)",
+                    payload: FTMSCommand.requestControl.payload,
+                    opcode: FTMSCommand.requestControl.requestOpcode
+                ) else {
+                    return .failed("\(name)_control_heartbeat_failed")
+                }
+                nextHeartbeat = Date().addingTimeInterval(2)
+            }
+            Thread.sleep(forTimeInterval: 0.25)
+        }
+        let packets = DispatchQueue.main.sync { totalTreadmillDataPackets - movementStart }
+        tt6fProbeState.packetsAfterStart += packets
+        tt6fProbeState.movementObserved = tt6fProbeState.movementObserved || telemetryMovement
+
+        print("Did the treadmill belt physically move during \(name)? Enter yes or no:")
+        guard let physicalMovement = promptYesNo() else {
+            return .failed("\(name)_movement_observation_missing")
+        }
+        tt6fProbeState.physicalMovementObserved = physicalMovement
+        let observation: [String: Any] = [
+            "name": name,
+            "order": order == .startThenSpeed ? "start_then_speed" : "speed_then_start",
+            "heartbeat": heartbeat,
+            "telemetryPackets": packets,
+            "telemetryMovementObserved": telemetryMovement,
+            "physicalMovementObserved": physicalMovement,
+            "snapshot": vitalwalkSnapshot(),
+        ]
+        tt6fProbeState.movementAttempts.append(observation)
+        logger.write("tt6f_probe.movement_attempt", observation)
+        return .observed(physicalMovement)
+    }
+
+    private func stopTT6FAttempt(context: String) -> Bool {
+        let result = sendVitalwalkCommand(
+            name: "stop",
+            payload: FTMSCommand.stop.payload,
+            opcode: FTMSCommand.stop.requestOpcode,
+            eventPrefix: "tt6f_probe"
+        )
+        recordTT6FCommandResult(result)
+        let stopped = waitForVitalwalkBeltToStop(timeout: 10)
+        guard result.succeeded else { return false }
+        return confirmVitalwalkBeltStoppedIfNeeded(
+            telemetryStopped: stopped,
+            context: context
+        )
+    }
+
+    private func promptYesNo() -> Bool? {
+        while true {
+            guard let input = readLine()?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() else {
+                return nil
+            }
+            switch input {
+            case "yes", "y": return true
+            case "no", "n": return false
+            default: print("Enter yes or no.")
+            }
+        }
+    }
+
+    private func requireTT6FCommand(
+        name: String,
+        payload: Data,
+        opcode: UInt8,
+        fields: [String: Any] = [:]
+    ) -> Bool {
+        let result = sendVitalwalkCommand(
+            name: name,
+            payload: payload,
+            opcode: opcode,
+            fields: fields,
+            eventPrefix: "tt6f_probe"
+        )
+        recordTT6FCommandResult(result, fields: fields)
+        return result.succeeded
+    }
+
+    private func recordTT6FCommandResult(
+        _ result: VitalwalkCommandResult,
+        fields: [String: Any] = [:]
+    ) {
+        let record = result.dictionary.merging(fields) { current, _ in current }
+        tt6fProbeState.commandResults.append(record)
+        logger.write("tt6f_probe.command_result", record)
+    }
+
+    private func abortTT6FProbe(reason: String, attemptStop: Bool) {
+        vitalwalkExitCode = 1
+        tt6fProbeState.abortedReason = reason
+        logger.write("tt6f_probe.aborted", [
+            "reason": reason,
+            "attemptStop": attemptStop,
+            "snapshot": vitalwalkSnapshot(),
+        ])
+        if attemptStop {
+            let result = sendVitalwalkCommand(
+                name: "emergency_stop",
+                payload: FTMSCommand.stop.payload,
+                opcode: FTMSCommand.stop.requestOpcode,
+                eventPrefix: "tt6f_probe",
+                timeout: 3
+            )
+            recordTT6FCommandResult(result)
+            let stopped = waitForVitalwalkBeltToStop(timeout: 8)
+            _ = confirmVitalwalkBeltStoppedIfNeeded(
+                telemetryStopped: stopped,
+                context: "before the TT6F probe exits"
+            )
+        }
+        vitalwalkMovementPossible = false
+        finishTT6FProbe()
+    }
+
+    private func finishTT6FProbe() {
+        logger.write("tt6f_probe.summary", [
+            "completed": tt6fProbeState.abortedReason == nil,
+            "abortedReason": tt6fProbeState.abortedReason ?? NSNull(),
+            "packetsBeforeControl": tt6fProbeState.packetsBeforeControl,
+            "packetsAfterControl": tt6fProbeState.packetsAfterControl,
+            "packetsWithHeartbeat": tt6fProbeState.packetsWithHeartbeat,
+            "packetsAfterStart": tt6fProbeState.packetsAfterStart,
+            "telemetryMovementObserved": tt6fProbeState.movementObserved,
+            "physicalMovementObserved": tt6fProbeState.physicalMovementObserved ?? NSNull(),
+            "movementAttempts": tt6fProbeState.movementAttempts,
+            "displayObservation": tt6fProbeState.displayObservation ?? NSNull(),
+            "commandResults": tt6fProbeState.commandResults,
+            "finalSnapshot": vitalwalkSnapshot(),
+        ])
+
+        print("")
+        print("===== TT6F Probe Report =====")
+        print("Completed: \(tt6fProbeState.abortedReason == nil ? "yes" : "no")")
+        if let reason = tt6fProbeState.abortedReason { print("Stopped because: \(reason)") }
+        print("Idle telemetry packets: \(tt6fProbeState.packetsBeforeControl)")
+        print("Packets after control: \(tt6fProbeState.packetsAfterControl)")
+        print("Packets with heartbeat: \(tt6fProbeState.packetsWithHeartbeat)")
+        print("Physical movement: \(tt6fProbeState.physicalMovementObserved.map { $0 ? "yes" : "no" } ?? "unknown")")
+        print("Log file: \(logger.path)")
+        print("Send this JSONL file with the issue report.")
+        print("==============================")
+
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            if let selected {
+                central.cancelPeripheralConnection(selected)
+            } else {
+                finish(tt6fProbeState.abortedReason == nil ? 0 : 1)
             }
         }
     }

@@ -80,6 +80,13 @@ import Testing
     #expect(rounded.payload == Data([0x02, 0x4A, 0x01]))
     #expect(rounded.target == 3.3)
 
+    let tt6f = try #require(FTMSCommand.speed(
+        requestedKmh: 3,
+        range: FTMSSpeedRange(minimumKmh: 1, maximumKmh: 10, incrementKmh: 0.1)
+    ))
+    #expect(tt6f.payload == Data([0x02, 0x2C, 0x01]))
+    #expect(tt6f.target == 3)
+
     #expect(FTMSCommand.speed(requestedKmh: .infinity, range: range) == nil)
 }
 
@@ -125,6 +132,14 @@ import Testing
         #expect(apolloResume.outputPath == "apollo-resume.jsonl")
     } else {
         Issue.record("expected Apollo resume probe mode")
+    }
+
+    let tt6f = Arguments.parse(["tt6f-probe", "--output", "tt6f.jsonl"])
+    #expect(tt6f.probeMode == false)
+    if case .tt6fProbe = tt6f.mode {
+        #expect(tt6f.outputPath == "tt6f.jsonl")
+    } else {
+        Issue.record("expected TT6F probe mode")
     }
 
     let r3 = Arguments.parse(["r3-probe", "--duration", "45"])
