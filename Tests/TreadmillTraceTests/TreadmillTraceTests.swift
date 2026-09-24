@@ -142,6 +142,14 @@ import Testing
         Issue.record("expected TT6F probe mode")
     }
 
+    let x21 = Arguments.parse(["x21-probe", "--output", "x21.jsonl"])
+    #expect(x21.probeMode == false)
+    if case .x21Probe = x21.mode {
+        #expect(x21.outputPath == "x21.jsonl")
+    } else {
+        Issue.record("expected X21 probe mode")
+    }
+
     let r3 = Arguments.parse(["r3-probe", "--duration", "45"])
     #expect(r3.probeMode == false)
     if case let .r3Probe(duration, controlTests) = r3.mode {

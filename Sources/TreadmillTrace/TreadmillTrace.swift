@@ -34,6 +34,7 @@ struct Arguments {
         var requestedVitalwalkProbe = false
         var requestedApolloResumeProbe = false
         var requestedTT6FProbe = false
+        var requestedX21Probe = false
 
         while let arg = iterator.next() {
             switch arg {
@@ -47,6 +48,8 @@ struct Arguments {
                 requestedApolloResumeProbe = true
             case "tt6f-probe":
                 requestedTT6FProbe = true
+            case "x21-probe":
+                requestedX21Probe = true
             case "--duration":
                 if let value = iterator.next(), let seconds = TimeInterval(value) {
                     result.r3ProbeDuration = seconds
@@ -73,6 +76,7 @@ struct Arguments {
                   treadmill-trace vitalwalk-probe [--output path] [--scan-seconds 12]
                   treadmill-trace apollo-resume-probe [--output path] [--scan-seconds 12]
                   treadmill-trace tt6f-probe [--output path] [--scan-seconds 12]
+                  treadmill-trace x21-probe [--output path] [--scan-seconds 12]
                   treadmill-trace r3-probe [--duration 30] [--output path] [--scan-seconds 12]
                   treadmill-trace r3-probe --control-tests --i-understand-this-may-move-the-belt
 
@@ -99,6 +103,11 @@ struct Arguments {
                 subscribing to FITSHOW notifications. It uses the reported minimum
                 speed and requires runtime confirmation because it moves the belt.
 
+                x21-probe validates the KingSmith X21 encrypted protocol, then guides
+                a passive capture while you operate the treadmill with its own panel
+                or remote. It then offers optional control validation, which moves
+                the belt only after runtime confirmation and an arming phrase.
+
                 r3-probe runs a WalkingPad R3 diagnostic. Safe mode sends FTMS
                 Request Control and known KingSmith supplement init/query commands,
                 but does not start the belt or change speed. Control tests require
@@ -117,6 +126,7 @@ struct Arguments {
             requestedVitalwalkProbe,
             requestedApolloResumeProbe,
             requestedTT6FProbe,
+            requestedX21Probe,
         ].filter { $0 }.count
         if requestedModes > 1 {
             fputs("probe modes cannot be combined\n", stderr)
@@ -143,6 +153,8 @@ struct Arguments {
             result.mode = .apolloResumeProbe
         } else if requestedTT6FProbe {
             result.mode = .tt6fProbe
+        } else if requestedX21Probe {
+            result.mode = .x21Probe
         }
 
         return result
@@ -156,6 +168,7 @@ enum CaptureMode {
     case vitalwalkProbe
     case apolloResumeProbe
     case tt6fProbe
+    case x21Probe
     case r3Probe(duration: TimeInterval, controlTests: Bool)
 }
 
@@ -198,6 +211,8 @@ final class BLECapture: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
     private var vitalwalkProbeState = VitalwalkProbeState()
     private var apolloResumeProbeState = ApolloResumeProbeState()
     private var tt6fProbeState = TT6FProbeState()
+    private var x21Session: X21ProbeSession?
+    private var x21Failure: X21ProbeFailure?
     private var vitalwalkMovementPossible = false
     private var vitalwalkExitCode: Int32 = 0
     private var sawNonzeroSpeed = false
@@ -360,6 +375,7 @@ final class BLECapture: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
         case .vitalwalkProbe: "vitalwalkProbe"
         case .apolloResumeProbe: "apolloResumeProbe"
         case .tt6fProbe: "tt6fProbe"
+        case .x21Probe: "x21Probe"
         case let .r3Probe(_, controlTests): controlTests ? "r3ProbeControlTests" : "r3Probe"
         }
     }
@@ -367,7 +383,7 @@ final class BLECapture: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
     private var isVitalwalkControlProbe: Bool {
         switch mode {
         case .vitalwalkProbe, .apolloResumeProbe, .tt6fProbe: true
-        case .guidedCapture, .interactiveProbe, .timeProbe, .r3Probe: false
+        case .guidedCapture, .interactiveProbe, .timeProbe, .x21Probe, .r3Probe: false
         }
     }
 
@@ -461,6 +477,10 @@ final class BLECapture: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
             "error": error?.localizedDescription ?? "none",
         ])
         print("Disconnected. Log saved to \(logger.path)")
+        if case .x21Probe = mode {
+            x21Session?.peripheralDisconnected(error: error)
+            finish(x21ExitCode)
+        }
         if isVitalwalkControlProbe {
             finish(vitalwalkExitCode)
         }
@@ -527,6 +547,8 @@ final class BLECapture: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
             },
         ])
 
+        if case .x21Probe = mode { return }
+
         for characteristic in characteristics {
             if characteristic.uuid == CBUUID(string: "2AD9") {
                 controlPointCharacteristic = characteristic
@@ -568,6 +590,10 @@ final class BLECapture: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
             "isNotifying": characteristic.isNotifying,
             "error": error?.localizedDescription ?? "none",
         ])
+        if case .x21Probe = mode {
+            handleX21NotificationState(characteristic, error: error)
+            return
+        }
         checkSetupComplete()
     }
 
@@ -629,6 +655,11 @@ final class BLECapture: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
         }
 
         guard let data = characteristic.value else { return }
+        if case .x21Probe = mode, !wasReadRequest,
+           X21Layout.normalized(characteristic.uuid.uuidString) == X21Layout.notify
+        {
+            x21Session?.receive(data)
+        }
         let decoded = parseKnownCharacteristic(characteristic: characteristic, data: data)
         updateCaptureState(characteristic: characteristic, decoded: decoded)
         updateR3ProbeState(characteristic: characteristic, data: data, decoded: decoded, wasReadRequest: wasReadRequest)
@@ -868,6 +899,10 @@ final class BLECapture: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
         else { return }
 
         setupComplete = true
+        if case .x21Probe = mode {
+            subscribeX21Probe()
+            return
+        }
         DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { [weak self] in
             guard let self else { return }
             if !self.readRequests.isEmpty {
@@ -889,10 +924,93 @@ final class BLECapture: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
                 self.startApolloResumeProbe()
             case .tt6fProbe:
                 self.startTT6FProbe()
+            case .x21Probe:
+                break
             case let .r3Probe(duration, controlTests):
                 self.startR3Probe(duration: duration, controlTests: controlTests)
             }
         }
+    }
+
+    private var x21ExitCode: Int32 {
+        x21Failure == nil && x21Session?.ended == true ? 0 : 1
+    }
+
+    /// Requires the revision-2 layout, then subscribes only to its notify characteristic without reads.
+    private func subscribeX21Probe() {
+        guard let selected else { return }
+        let services = (selected.services ?? []).map { service in
+            X21GATTService(
+                uuid: service.uuid.uuidString,
+                characteristics: (service.characteristics ?? []).map {
+                    X21GATTCharacteristic(uuid: $0.uuid.uuidString, properties: $0.properties)
+                }
+            )
+        }
+        let maximumWrite = selected.maximumWriteValueLength(for: .withoutResponse)
+        let mismatch = X21Layout.validate(services, maximumWriteWithoutResponse: maximumWrite)
+        logger.write("x21_probe.layout", [
+            "valid": mismatch == nil,
+            "failure": mismatch?.reason ?? NSNull(),
+            "expected": ["service": X21Layout.service, "write": X21Layout.write, "notify": X21Layout.notify],
+            "maximumWriteWithoutResponse": maximumWrite,
+        ])
+        guard mismatch == nil,
+              let notify = findX21Characteristic(X21Layout.notify, in: selected)
+        else {
+            failX21Probe(mismatch ?? .layoutMismatch("notify characteristic unavailable"))
+            return
+        }
+        print("Revision-2 X21 layout found. Enabling notifications...")
+        selected.setNotifyValue(true, for: notify)
+    }
+
+    private func handleX21NotificationState(_ characteristic: CBCharacteristic, error: Error?) {
+        guard x21Session == nil,
+              X21Layout.normalized(characteristic.uuid.uuidString) == X21Layout.notify,
+              let selected
+        else { return }
+        guard error == nil, characteristic.isNotifying,
+              let write = findX21Characteristic(X21Layout.write, in: selected)
+        else {
+            failX21Probe(.notificationSetupFailed(error?.localizedDescription ?? "not notifying"))
+            return
+        }
+        discoveryTimeout?.invalidate()
+        let session = X21ProbeSession(
+            logger: logger,
+            peripheral: selected,
+            writeCharacteristic: write,
+            subscribedAt: Date()
+        ) { [weak self] failure in
+            guard let self else { return }
+            x21Failure = failure
+            if selected.state == .connected || selected.state == .connecting {
+                central.cancelPeripheralConnection(selected)
+            }
+        }
+        x21Session = session
+        session.start()
+    }
+
+    private func failX21Probe(_ failure: X21ProbeFailure) {
+        discoveryTimeout?.invalidate()
+        x21Failure = failure
+        logger.write("x21_probe.summary", ["succeeded": false, "failure": failure.reason, "protocolValidated": false])
+        print("X21 probe stopped: \(failure.reason)")
+        print("Log file: \(logger.path)")
+        if let selected {
+            central.cancelPeripheralConnection(selected)
+        } else {
+            finish(1)
+        }
+    }
+
+    private func findX21Characteristic(_ uuid: String, in peripheral: CBPeripheral) -> CBCharacteristic? {
+        peripheral.services?
+            .first { X21Layout.normalized($0.uuid.uuidString) == X21Layout.service }?
+            .characteristics?
+            .first { X21Layout.normalized($0.uuid.uuidString) == uuid }
     }
 
     private func startTT6FProbe() {
@@ -2700,7 +2818,14 @@ final class BLECapture: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
             source.setEventHandler { [weak self] in
                 guard let self else { exit(1) }
                 print("\nInterrupted. Closing log...")
-                if self.vitalwalkMovementPossible, self.isVitalwalkControlProbe {
+                if let session = self.x21Session, session.movementPossible {
+                    session.emergencyStop(reason: "signal_\(signalNumber)")
+                    Timer.scheduledTimer(withTimeInterval: 1.0, repeats: false) { [weak self] _ in
+                        guard let self else { exit(1) }
+                        self.logger.write("session.end", ["reason": "interrupted", "signal": signalNumber])
+                        self.finish(1)
+                    }
+                } else if self.vitalwalkMovementPossible, self.isVitalwalkControlProbe {
                     self.attemptVitalwalkEmergencyStopFromMain(reason: "signal_\(signalNumber)")
                     Timer.scheduledTimer(withTimeInterval: 1.0, repeats: false) { [weak self] _ in
                         guard let self else { exit(1) }

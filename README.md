@@ -125,6 +125,51 @@ Send the generated JSONL file with the issue report. A successful run confirms
 whether the proposed WalkingMate path can both start the belt and retain
 tracking without distributing a WalkingMate build.
 
+## KingSmith X21 diagnostic
+
+Use this probe for a KingSmith X21 (`KS-NACH-X21C`) that connects but reports no
+data:
+
+```sh
+.build/release/TreadmillTrace x21-probe --output ~/Desktop/x21.jsonl
+```
+
+The probe requires the X21 service `00021234` with characteristics `0002FED7`
+and `0002FED8`, and stops on any other layout. It performs the X21 handshake
+with one candidate encoding table and requests idle status. It stops on an
+invalid response, a timeout, or a disconnect.
+
+After the handshake succeeds, the probe guides a passive capture. You start the
+belt at its lowest speed, raise the speed by one step, and stop the belt, all
+from the treadmill panel or remote. During these phases TreadmillTrace sends only
+status queries. Type `q` at any prompt to finish early. The log is kept.
+
+The probe then offers optional control validation. This part moves the belt.
+It uses only the lowest speed and the next speed that the treadmill reported
+during the passive capture. The lowest speed must be 2.0 km/h or less, and the
+next speed must be at most 0.5 km/h higher. Before any command, the treadmill
+must report that it is stopped, and you must type `RUN X21 CONTROL PROBE`.
+Stand off the belt and keep the physical stop control within reach.
+
+The probe sends manual mode, Start, the low speed, the next speed, and Stop, in
+that order, and checks the reported status after every command. Start comes
+before the speed target because that is the reported start sequence for this
+protocol, and setting a speed before Start is not established for the X21. The
+treadmill therefore chooses its own start speed. If it reports a speed above
+the planned maximum, the probe sends Stop. The next speed is sent only after
+you confirm that the belt moves at the low speed.
+
+The probe sends Stop on a missing or stale status, an unexpected state, a
+speed above the plan, a failure, or an interruption. It then asks you to
+confirm that the belt has physically stopped, and sends Stop again until you
+do. Until then, it reports that the belt may still be moving. Pause and incline
+are not tested. Press return at the offer to skip control validation and keep
+the passive results.
+
+Send the generated JSONL file with the issue report. It records raw and decoded
+traffic with timing, and summarizes the passive and control results
+separately.
+
 ## Probe mode
 
 ```sh
