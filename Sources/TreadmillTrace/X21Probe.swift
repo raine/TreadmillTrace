@@ -53,7 +53,7 @@ final class X21ProbeSession {
     fileprivate let logger: TraceLogger
     private let peripheral: CBPeripheral
     private let writeCharacteristic: CBCharacteristic
-    private let table = X21SubstitutionTable.v1
+    private let table = X21SubstitutionTable.x21V4
     private let subscribedAt: Date
     private let onEnded: (X21ProbeFailure?) -> Void
 
@@ -256,7 +256,7 @@ final class X21ProbeSession {
     private func handle(_ frame: Data) {
         let latency: Any = milliseconds(since: lastWriteAt) ?? NSNull()
         let event: X21ProbeEvent
-        switch X21Codec.decode(frame, table: table) {
+        switch X21Codec.decodeBytes(frame, table: table) {
         case let .failure(category):
             decodeFailures += 1
             logger.write("x21_probe.rx_frame", [
@@ -267,20 +267,22 @@ final class X21ProbeSession {
                 "msSinceLastWrite": latency,
             ])
             event = machine.decodeFailed(category)
-        case let .success(text):
+        case let .success(decoded):
             decodedFrames += 1
             let awaiting = machine.awaitingCommand?.name ?? "none"
-            event = machine.receive(text)
+            event = machine.receive(decoded)
+            let text = String(data: decoded, encoding: .utf8)
             var record: [String: Any] = [
                 "hex": frame.hexString,
+                "decodedHex": decoded.hexString,
                 "table": table.id,
-                "text": text,
+                "text": text ?? NSNull(),
                 "awaiting": awaiting,
                 "result": describe(event),
                 "phase": currentPhase ?? NSNull(),
                 "msSinceLastWrite": latency,
             ]
-            if let properties = X21PropertyMessage.parse(text) {
+            if let text, let properties = X21PropertyMessage.parse(text) {
                 record["properties"] = properties.dictionary
             }
             logger.write("x21_probe.rx_frame", record)

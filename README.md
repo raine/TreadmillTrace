@@ -136,8 +136,9 @@ data:
 
 The probe requires the X21 service `00021234` with characteristics `0002FED7`
 and `0002FED8`, and stops on any other layout. It performs the X21 handshake
-with one candidate encoding table and requests idle status. It stops on an
-invalid response, a timeout, or a disconnect.
+with the encoding table observed on the affected X21 revision and requests idle
+status. Binary fields in handshake replies are preserved in the log. The probe
+stops on an invalid response, a timeout, or a disconnect.
 
 After the handshake succeeds, the probe guides a passive capture. You start the
 belt at its lowest speed, raise the speed by one step, and stop the belt, all

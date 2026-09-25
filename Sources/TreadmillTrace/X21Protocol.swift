@@ -9,6 +9,12 @@ struct X21SubstitutionTable: Equatable {
         id: "v1",
         alphabet: Array("SaCw4FGHIJqLhN+P9RVTU/WcY6ObDdefgEijklmnopQrsBuvMxXz1yA2t5078KZ3=".utf8)
     )
+
+    /// The table used by the observed KS-NACH-X21C revision-2 device.
+    static let x21V4 = X21SubstitutionTable(
+        id: "x21-v4",
+        alphabet: Array("iaCw4FGHIJqLhN+P9RVTU/WcY6ObDdefgEZjklmnopQrsBuvMxXz1yA2t5078KS3=".utf8)
+    )
 }
 
 enum X21DecodeFailure: String, Error, Equatable {
@@ -38,16 +44,27 @@ enum X21Codec {
         }
     }
 
-    /// Decodes one frame whose terminator has already been removed.
-    static func decode(_ frame: Data, table: X21SubstitutionTable) -> Result<String, X21DecodeFailure> {
+    /// Decodes one frame whose transport terminator has already been removed.
+    /// Handshake payloads may contain binary bytes, so protocol handling uses this method.
+    static func decodeBytes(_ frame: Data, table: X21SubstitutionTable) -> Result<Data, X21DecodeFailure> {
         var base64 = Data()
         for byte in frame {
             guard let index = table.alphabet.firstIndex(of: byte) else { return .failure(.unknownByte) }
             base64.append(plainAlphabet[index])
         }
         guard let decoded = Data(base64Encoded: base64) else { return .failure(.invalidBase64) }
-        guard let text = String(data: decoded, encoding: .utf8) else { return .failure(.invalidUTF8) }
-        return .success(text)
+        return .success(decoded)
+    }
+
+    /// Text-only convenience used for property messages and test vectors.
+    static func decode(_ frame: Data, table: X21SubstitutionTable) -> Result<String, X21DecodeFailure> {
+        switch decodeBytes(frame, table: table) {
+        case let .failure(failure):
+            return .failure(failure)
+        case let .success(decoded):
+            guard let text = String(data: decoded, encoding: .utf8) else { return .failure(.invalidUTF8) }
+            return .success(text)
+        }
     }
 }
 
@@ -228,15 +245,19 @@ enum X21SafeCommand: Equatable {
         }
     }
 
-    func accepts(_ response: String) -> Bool {
-        let tokens = X21PropertyMessage.tokenize(response) ?? []
+    func accepts(_ response: Data) -> Bool {
+        let expected = plaintext.split(separator: " ").first.map(String.init) ?? plaintext
         switch self {
         case .formatProbe:
-            return response.lowercased().contains("format error")
+            return response.starts(with: Data("format error".utf8))
         case .shortPropertyQuery:
-            return tokens.contains("servers") || X21PropertyMessage.parse(response) != nil
+            guard let text = String(data: response, encoding: .utf8) else { return false }
+            let tokens = X21PropertyMessage.tokenize(text) ?? []
+            return tokens.contains("servers") || X21PropertyMessage.parse(text) != nil
         case .shake, .net, .getDN, .getPK, .timePosix, .version:
-            return tokens.contains(plaintext.split(separator: " ").first.map(String.init) ?? plaintext)
+            // Some X21 handshake replies append opaque binary fields directly after the
+            // command name. Match the ASCII prefix without requiring the suffix to be text.
+            return response.starts(with: Data(expected.utf8))
         }
     }
 }
@@ -317,8 +338,9 @@ struct X21ProbeMachine {
         return handshake[0]
     }
 
-    mutating func receive(_ text: String) -> X21ProbeEvent {
-        let properties = X21PropertyMessage.parse(text)
+    mutating func receive(_ response: Data) -> X21ProbeEvent {
+        let text = String(data: response, encoding: .utf8)
+        let properties = text.flatMap(X21PropertyMessage.parse)
         if let properties { propertyMessages.append(properties) }
 
         switch state {
@@ -326,7 +348,7 @@ struct X21ProbeMachine {
             return .ignored
         case let .handshake(index):
             let command = handshake[index]
-            if command.accepts(text) {
+            if command.accepts(response) {
                 if index + 1 < handshake.count {
                     state = .handshake(index + 1)
                     return .advance(handshake[index + 1])
@@ -335,11 +357,14 @@ struct X21ProbeMachine {
                 return .advance(.shortPropertyQuery)
             }
             if properties != nil { return .waiting }
-            return fail(.unexpectedResponse(command: command.name, text: text))
+            return fail(.unexpectedResponse(command: command.name, text: text ?? "hex: \(response.hexString)"))
         case let .idlePoll(index):
             guard properties != nil else {
-                if X21SafeCommand.shortPropertyQuery.accepts(text) { return .waiting }
-                return fail(.unexpectedResponse(command: X21SafeCommand.shortPropertyQuery.name, text: text))
+                if X21SafeCommand.shortPropertyQuery.accepts(response) { return .waiting }
+                return fail(.unexpectedResponse(
+                    command: X21SafeCommand.shortPropertyQuery.name,
+                    text: text ?? "hex: \(response.hexString)"
+                ))
             }
             if index + 1 < idlePollCount {
                 state = .idlePoll(index + 1)
@@ -350,8 +375,12 @@ struct X21ProbeMachine {
             return .validated
         case .observing:
             if let properties { return .pollAnswered(properties) }
-            return X21SafeCommand.shortPropertyQuery.accepts(text) ? .waiting : .ignored
+            return X21SafeCommand.shortPropertyQuery.accepts(response) ? .waiting : .ignored
         }
+    }
+
+    mutating func receive(_ text: String) -> X21ProbeEvent {
+        receive(Data(text.utf8))
     }
 
     /// Decode failures reject table v1 until passive observation has begun, after which they are logged only.

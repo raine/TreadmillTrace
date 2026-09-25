@@ -5,12 +5,12 @@ import Testing
 
 private func hex(_ data: Data) -> String { data.hexString }
 
-private func encoded(_ text: String) -> Data {
-    X21Codec.encode(text, table: .v1)
+private func encoded(_ text: String, table: X21SubstitutionTable = .v1) -> Data {
+    X21Codec.encode(text, table: table)
 }
 
-private func frame(_ text: String) -> Data {
-    encoded(text).dropLast()
+private func frame(_ text: String, table: X21SubstitutionTable = .v1) -> Data {
+    encoded(text, table: table).dropLast()
 }
 
 @Test func encodesX21TestVectors() {
@@ -39,6 +39,29 @@ private func frame(_ text: String) -> Data {
     let invalidUTF8 = Data(Data([0xFF, 0xFE]).base64EncodedString().utf8)
     let substituted = Data(invalidUTF8.map { X21SubstitutionTable.v1.alphabet[X21Codec.plainAlphabet.firstIndex(of: $0)!] })
     #expect(X21Codec.decode(substituted, table: .v1) == .failure(.invalidUTF8))
+}
+
+@Test func decodesObservedBinaryX21V4Handshake() throws {
+    let formatFrame = Data("6mKXbWF1IG/XDmKXw9==".utf8)
+    let shakeFrame = Data("DAEEOAUGHwiN".utf8)
+
+    #expect(try X21Codec.decodeBytes(formatFrame, table: .x21V4).get() == Data("format error\r".utf8))
+    #expect(try X21Codec.decodeBytes(shakeFrame, table: .x21V4).get() == Data([0x73, 0x68, 0x61, 0x6B, 0x65, 0x06, 0x1C, 0x30, 0x0D]))
+    #expect(X21Codec.decode(shakeFrame, table: .v1) == .failure(.invalidUTF8))
+
+    var machine = X21ProbeMachine()
+    #expect(machine.start(unixTime: 1_700_000_000) == .formatProbe)
+    #expect(machine.receive(Data("format error\r".utf8)) == .advance(.shake))
+    #expect(machine.receive(Data([0x73, 0x68, 0x61, 0x6B, 0x65, 0x06, 0x1C, 0x30, 0x0D])) == .advance(.net))
+}
+
+@Test func encodesX21V4CommandsWithObservedTable() {
+    #expect(encoded("shake", table: .x21V4) == encoded("shake", table: .v1))
+    #expect(hex(encoded("servers getProp 1 2 7 12 23 24 31", table: .x21V4)) == """
+    44 41 2F 58 64 6D 2F 58 44 58 61 6E 36 63 52 39 \
+    44 6D 4B 4D 49 77 34 67 68 5A 69 32 49 77 34 58 \
+    49 77 49 7A 49 77 49 31 49 77 68 78 0D
+    """)
 }
 
 @Test func reassemblesFragmentedX21Frames() {
